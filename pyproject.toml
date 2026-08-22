@@ -1,0 +1,51 @@
+[project]
+name = "cordboard"
+version = "0.1.0"
+description = "Pass work between coding agents with a file-based baton — no server, no broker, just a spec and a JSON file in your repo."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Chandresh Kumar" }]
+keywords = ["agents", "coding-agents", "collaboration", "workflow", "baton"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Build Tools",
+]
+# No runtime dependencies, on purpose: this is dropped into other people's repos
+# and has to run from a bare interpreter, including inside an agent's sandbox.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+cordboard = "cordboard.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/chandresh/cordboard"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cordboard"]
+
+[tool.hatch.build]
+# The spec and templates ship with the package: agents read the spec at runtime,
+# and `cordboard init` writes the templates into the host repo.
+include = ["src/cordboard/data/*"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# src layout: importable without an editable install, so a fresh clone can just
+# run pytest.
+pythonpath = ["src"]
