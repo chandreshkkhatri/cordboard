@@ -78,6 +78,60 @@ cordboard/
 The split is deliberate: the spec and the stack are shared facts about the work, and the baton is
 one machine's runtime state. Committing `status.json` would mean merge conflicts on every handoff.
 
+---
+
+## The board file
+
+`status.json`, in full. Written only through `cordboard set`.
+
+```json
+{
+  "version": 3,
+  "enabled": false,
+  "workflow": "redline",
+  "auto_commit": true,
+  "max_rounds": 3,
+  "lease_seconds": 5400,
+  "rev": 0,
+  "roles": { "reviewer": "cc", "author": "ag" },
+  "agents": {
+    "cc": { "status": "paused", "trigger": "watch", "heartbeat": null, "chat_cursor": 0, "note": "" },
+    "ag": { "status": "paused", "trigger": "tick", "heartbeat": null, "chat_cursor": 0, "note": "" }
+  },
+  "lock": { "holder": null, "acquired_at": null, "expires_at": null },
+  "task": {
+    "id": null,
+    "title": null,
+    "kind": "implement",
+    "phase": "idle",
+    "dir": null,
+    "plan_file": null,
+    "last_redline": null,
+    "verdict": null,
+    "round": { "plan": 0, "impl": 0 }
+  },
+  "updated_at": null,
+  "updated_by": "user"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `enabled` | Master switch. False makes every tick a no-op and every `wait` exit 10. |
+| `workflow` | `relay` or `redline` — which phase graph applies. |
+| `rev` | Bumped on every write. The compare-and-swap reads it; never set it by hand. |
+| `roles` | Role → agent name. Both roles must be filled for the board to run. |
+| `agents.<name>.trigger` | `tick` or `watch`, per agent. |
+| `agents.<name>.chat_cursor` | Line count of `chat.md` this agent has read. |
+| `agents.<name>.note` | Free text from that agent's last tick — where a blocked agent says why. |
+| `lock` | The work lease. An expired lease is stealable; that is the crash recovery. |
+| `task.kind` | `implement`, or `plan_only` to finish at the plan and skip the build. |
+| `task.dir` | The task's directory under `plans/`, holding `plan.md` and its redlines. |
+| `task.verdict` | The last redline's verdict: `approve`, `revise`, or `reject`. |
+| `task.round` | Rounds spent at each gate, against `max_rounds`. |
+| `auto_commit` | Whether a finishing tick commits, per **Commit Scope** below. |
+| `lease_seconds` | Lease TTL. Long enough to outlast a slow phase, short enough to recover. |
+
 Per-task directory:
 
 ```
@@ -101,10 +155,15 @@ compare-and-swap. Hand-editing races with a live agent and silently loses writes
 | Command | Purpose |
 |---|---|
 | `cordboard status` | Read state. `--json`, `--get task.phase`, `--turn <agent>` (exit 0 = its turn) |
-| `cordboard set` | Write state. Refuses out-of-turn phase moves unless `--force` |
+| `cordboard set` | Write state. Refuses out-of-turn moves and illegal transitions unless `--force` |
 | `cordboard wait <agent>` | Block until it is that agent's turn. The `watch` trigger |
 | `cordboard say` | Append to / read the chat back-channel |
-| `cordboard init` | Create state, or `--migrate` a v1 file |
+| `cordboard init` | Create a board, or `--migrate` a v2 one |
+| `cordboard spec` | Print this document |
+
+Every command takes `--dir <path>`, before or after the subcommand, and honours `$CORDBOARD_DIR`.
+Without either, the board is `./cordboard/` relative to the working directory — so a tick that runs
+from somewhere else must say where the board is.
 
 Typical agent write:
 
@@ -132,7 +191,7 @@ set `blocked` instead. The round cap is therefore a real constraint, not just ad
 
 ## Workflow: `relay`
 
-Each agent owns a different leg. This is the original v1 flow, unchanged in behaviour.
+Each agent owns a different leg, and the reviewer holds the pen for the plan.
 
 ```
 awaiting_plan ─(reviewer)─▶ planning ─(reviewer)─▶ plan_ready ─(author)─▶ implementing
@@ -310,8 +369,12 @@ Rules:
 
 ### `tick` — clock-driven
 
-A cron/timer fires the agent on a schedule. Under `relay` the two timers should stay 15 minutes out
-of phase (`5,35` and `20,50`), which is how v1 avoided collisions.
+A cron or timer fires the agent on a schedule, whatever the workflow. Two agents both on `tick`
+should have **offset** schedules — `5,35` and `20,50` — so a handoff lands in the gap instead of both
+waking at once. The lock and CAS make a simultaneous pair safe; offsetting just wastes fewer ticks.
+
+The cost of `tick` is latency: a handoff waits for the next scheduled wake, so half the interval on
+average.
 
 ### `watch` — state-driven
 
@@ -375,12 +438,16 @@ queued work). A commit must therefore be **scoped to the task**:
 
 ## Human Overrides
 
-- `cordboard set --enabled false` halts every tick immediately (and makes live `cordboard wait` calls exit 10).
+- `cordboard set --start` moves the baton to the current workflow's entry phase. This is how a run
+  begins: no role owns `idle`, so no agent can start itself.
+- `cordboard set --enabled false` halts every tick immediately, and makes live `cordboard wait` calls
+  exit 10. The baton stays exactly where it is, so resuming costs nothing.
 - `cordboard set --role author=<agent>` reassigns a role. Point both roles at one agent to go solo.
 - `cordboard set --workflow redline` (or `relay`) switches the phase graph. Do it at `idle` — switching
   mid-task strands the baton in a phase the new graph does not have, and `cordboard set` will refuse it.
 - Edit `cordboard/TODO.md` freely to add, reorder, or remove tasks.
-- `cordboard set --force --key task.phase --value <phase>` reassigns the baton by hand.
+- `cordboard set --force --phase <phase>` reassigns the baton by hand. `--force` skips both guards, so
+  it is the tool for recovering a stuck board — not the tool for ordinary moves.
 
 ---
 
@@ -415,4 +482,19 @@ The lock and CAS make simultaneous ticks safe, but offset ones waste less.
 
 ### Go live
 
-The loop is inert until `enabled` is true. Arm both agents first, then `cordboard set --enabled true`.
+The board is inert until `enabled` is true, and nothing happens with an empty stack. In order:
+
+```bash
+# 1. queue work — bottom of the file is picked first
+$EDITOR cordboard/TODO.md
+
+# 2. arm both agents (above), then hand the baton to the workflow's first phase
+cordboard set --start
+
+# 3. go live
+cordboard set --enabled true
+cordboard status              # confirms whose turn it is
+```
+
+Reverse it to stop: `cordboard set --enabled false`. The agents stay armed and every tick becomes a
+no-op, so flipping it back resumes mid-task.

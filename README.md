@@ -6,11 +6,30 @@ JSON file in your repo.
 Two coding agents, whatever they are, work a shared task stack without stepping on each other. One
 holds the baton at a time; the board says who, and refuses moves that would skip a review gate.
 
+## Install
+
+Not on PyPI yet — from source for now:
+
 ```bash
-uvx cordboard init            # or: pipx run cordboard init
-uvx cordboard set --start
-uvx cordboard set --enabled true
+git clone https://github.com/chandresh/cordboard && cd cordboard
+python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 ```
+
+Once published, `uvx cordboard` / `pipx run cordboard` will work without an install.
+
+## Use
+
+```bash
+cd /your/repo
+cordboard init                 # writes ./cordboard/
+$EDITOR cordboard/TODO.md      # queue work; the bottom entry runs first
+cordboard set --start          # hand the baton to the first phase
+cordboard set --enabled true
+cordboard status               # whose turn is it
+```
+
+Every command takes `--dir <path>` (before or after the subcommand) and honours `$CORDBOARD_DIR`,
+so the board does not have to live at `./cordboard`.
 
 ## Why a file
 
@@ -71,12 +90,15 @@ human.
 
 | Command | Purpose |
 |---|---|
-| `cordboard init` | Create a board. `--migrate` imports a v2 `collab/` board. |
+| `cordboard init` | Create a board. `--migrate` imports a v2 board. |
 | `cordboard status` | Read it. `--json`, `--get task.phase`, `--turn <agent>` (exit 0 = its turn). |
 | `cordboard set` | Move the baton or change config. `--start` kicks off; `--force` overrides a guard. |
-| `cordboard wait <agent>` | Block until it is that agent's turn. |
+| `cordboard wait <agent>` | Block until it is that agent's turn. Exit `0`/`10`/`11`/`2`. |
 | `cordboard say` | Append to or read the back-channel. |
 | `cordboard spec` | Print the protocol spec the agents follow. |
+
+`cordboard spec` is the whole protocol: the phase graphs, both tick algorithms, the redline comment
+format, and the board schema. It is what you give an agent to read at the top of a tick.
 
 Never hand-edit `status.json` while agents are live — `cordboard set` locks and compare-and-swaps;
 an editor does neither.
@@ -98,10 +120,28 @@ cordboard/
 The spec and the stack are shared facts about the work. The baton is one machine's runtime state —
 committing it would mean a merge conflict on every handoff.
 
+## Development
+
+```bash
+.venv/bin/python -m pytest      # 53 tests
+.venv/bin/python -m ruff check .
+```
+
+`tests/test_docs.py` asserts the shipped spec still matches the code — the board schema key-for-key,
+every subcommand, the `wait` exit codes, and every phase of every workflow. The spec is package data
+that agents parse, so drift there is a bug rather than a typo.
+
 ## Status
 
-Early. The protocol has run real tasks in the repo it was extracted from; the package itself is new.
-`cordboard init --migrate` exists to move an in-flight v2 board across without losing the task.
+Early, and honest about it. The protocol has run real tasks in the repo it was extracted from, but
+the package is new: the phase machine, guards, CAS and migration are covered by tests, while the
+`watch` trigger's integration with any *particular* agent host is not — that depends on whether the
+host re-invokes an agent when a background process exits.
+
+`requires-python` says 3.10, which is a syntax claim: CI does not yet run the suite on anything but
+3.14.
+
+`cordboard init --migrate` moves an in-flight v2 board across without losing the task.
 
 ## License
 
