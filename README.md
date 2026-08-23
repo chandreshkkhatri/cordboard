@@ -50,19 +50,28 @@ diff, the author applies and commits. Verdicts bound it: `approve` proceeds, `re
 and carry on, `reject` sends it back for another round — and a round cap turns the third `reject`
 into `blocked` rather than a loop.
 
-## The two triggers
+## How an agent finds out
 
-Set per agent, because hosts differ.
+Two settings per agent, and they are **not** alternatives:
 
-- **`tick`** — a timer wakes the agent on a schedule.
-- **`watch`** — `cordboard wait <agent>` blocks until the baton is that agent's, then exits.
+- **`watch`** (default on) — `cordboard wait <agent>` blocks until the baton is that agent's, then
+  exits. Handoffs are picked up in seconds. The watcher polls and the agent blocks, so waiting costs
+  no tokens: no model turn runs until `wait` returns. Exit codes are the contract — `0` your turn,
+  `10` board disabled, `11` timed out, `2` unusable board.
+- **`tick`** (default `*/20`) — the backstop. It does not drive the loop; it notices that the loop
+  did not move. Watchers fail quietly: a session ends, a host does not re-invoke, a process is
+  killed. Without a tick behind it, a dropped watcher looks exactly like an idle board.
 
-`watch` is the reason handoffs take a second instead of half a timer interval. The watcher polls and
-the agent blocks, so waiting costs no tokens: no model turn is running until `wait` returns. Its
-exit codes are the contract — `0` your turn, `10` board disabled, `11` timed out, `2` unusable board.
+Keep the tick slow. A fast one is polling with extra steps, and it hides the failure it exists to
+reveal. An agent whose host cannot watch at all sets `watch: false` and runs on its tick alone —
+that is the case to tighten. An agent with neither is unreachable, and `cordboard set` refuses it.
 
-A mixed pair is normal: put the agent whose host can react to a process exit on `watch`, leave the
-other on `tick`.
+Every phase change stamps `task.handoff_at`, so a missed handoff is measurable rather than a
+suspicion:
+
+```bash
+cordboard status --stalled     # exit 0 = the watcher missed this one
+```
 
 ## Roles, and why there is no "solo mode"
 

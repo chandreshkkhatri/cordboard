@@ -93,7 +93,13 @@ def test_migrate_v2_keeps_the_task_in_flight(tmp_path):
     assert "mode" not in data
     assert "claude_code" not in data  # no longer a top-level key
     assert data["agents"]["claude_code"]["note"] == "n1"
-    assert data["agents"]["claude_code"]["trigger"] == "watch"
+    # v2's `trigger: watch` becomes watch-primary *plus* the backstop it never had.
+    assert data["agents"]["claude_code"]["watch"] is True
+    assert data["agents"]["claude_code"]["tick"]
+    # v2's `trigger: tick` does not silently gain a watcher — that host was put on
+    # a timer because it could not watch, and claiming otherwise is a guess.
+    assert data["agents"]["antigravity"]["watch"] is False
+    assert data["agents"]["antigravity"]["tick"]
     assert "migrated v2" in report
 
 

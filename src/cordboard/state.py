@@ -21,10 +21,19 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 DEFAULT_MAX_ROUNDS = 3
 DEFAULT_LEASE_SECONDS = 5400
+
+#: A backstop schedule for an agent whose watcher is primary. Slow on purpose: it
+#: exists to catch a missed handoff, not to drive the loop.
+DEFAULT_TICK = "*/20 * * * *"
+
+#: How long the baton may sit with an agent before we call the handoff missed.
+#: Longer than a watcher takes to react (seconds) and shorter than the backstop
+#: interval, so a stall is visible before the tick papers over it.
+DEFAULT_STALL_AFTER_SECONDS = 600
 TIMESTAMP = "%Y-%m-%dT%H:%M:%SZ"
 
 #: Directory name created inside the host repo. Visible rather than dot-hidden:
@@ -137,6 +146,13 @@ def update(
                 # the caller's own earlier read and this critical section.
                 if int(load(root).get("rev", 0)) != base_rev:
                     continue
+                # Stamped here rather than by callers: every phase change goes
+                # through this function, and a hand-maintained timestamp is one
+                # an agent eventually forgets on the path that matters.
+                before = (data.get("task") or {}).get("phase")
+                after = (draft.get("task") or {}).get("phase")
+                if after != before:
+                    draft.setdefault("task", {})["handoff_at"] = now()
                 draft["rev"] = base_rev + 1
                 draft["updated_at"] = now()
                 draft["updated_by"] = actor
@@ -178,6 +194,44 @@ def claim_lease(data: dict[str, Any], agent: str, seconds: int | None = None) ->
 
 def release_lease(data: dict[str, Any]) -> None:
     data["lock"] = {"holder": None, "acquired_at": None, "expires_at": None}
+
+
+# --------------------------------------------------------------------------- stalls
+
+
+def stall_after(data: dict[str, Any]) -> int:
+    return int(data.get("stall_after_seconds") or DEFAULT_STALL_AFTER_SECONDS)
+
+
+def waiting_seconds(data: dict[str, Any]) -> int | None:
+    """How long the baton has sat in the current phase, or None if unknown.
+
+    Unknown is the honest answer for a board written before `handoff_at` existed,
+    and for one whose stamp is unparseable. Callers must not read it as zero.
+    """
+    stamp = (data.get("task") or {}).get("handoff_at")
+    if not stamp:
+        return None
+    try:
+        entered = datetime.strptime(stamp, TIMESTAMP).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - entered).total_seconds()))
+
+
+def is_stalled(data: dict[str, Any]) -> bool:
+    """The baton is owed to somebody who has not taken it in time.
+
+    This is the only signal that a watcher missed its event: a healthy `watch`
+    agent claims within seconds, so anything past the threshold means the wake
+    never arrived and the backstop tick is what will have to catch it.
+    """
+    if not data.get("enabled"):
+        return False
+    waited = waiting_seconds(data)
+    if waited is None:
+        return False
+    return waited >= stall_after(data)
 
 
 # --------------------------------------------------------------------------- accessors

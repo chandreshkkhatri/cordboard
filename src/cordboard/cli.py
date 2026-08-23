@@ -94,6 +94,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     root = _root(args)
     data = state.load(root)
 
+    if args.stalled:
+        # For a backstop tick to report what it caught: exit 0 means the handoff
+        # was missed and this wake is the one doing the work.
+        return 0 if state.is_stalled(data) else EXIT_REFUSED
     if args.turn:
         return WAIT_TURN if roles.is_my_turn(data, args.turn) else EXIT_REFUSED
     if args.get:
@@ -107,13 +111,22 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0
 
     print(roles.describe(data))
+
+    waited = state.waiting_seconds(data)
+    if waited is not None and roles.owner(data):
+        flag = "  ** STALLED **" if state.is_stalled(data) else ""
+        print(f"  waiting {_duration(waited)} in this phase{flag}")
+
     mapping = data.get("roles") or {}
     for name in state.agent_names(data):
         block = state.agents(data)[name] or {}
         held = ",".join(sorted(r for r in ROLES if mapping.get(r) == name)) or "—"
+        wakes = "watch" if block.get("watch") else "no-watch"
+        if block.get("tick"):
+            wakes += f"+tick({block['tick']})"
         print(
             f"  {name:<18} {block.get('status', '?'):<8} "
-            f"trigger={block.get('trigger', 'tick'):<6} roles={held:<16} "
+            f"{wakes:<26} roles={held:<16} "
             f"beat={block.get('heartbeat') or '—'}"
         )
     lock = data.get("lock") or {}
@@ -178,13 +191,21 @@ def cmd_set(args: argparse.Namespace) -> int:
         if args.bump_round:
             rounds = data.setdefault("task", {}).setdefault("round", {"plan": 0, "impl": 0})
             rounds[args.bump_round] = int(rounds.get(args.bump_round, 0)) + 1
-        if args.trigger:
+        if args.watch is not None or args.tick is not None:
             if not args.agent:
-                problems.append("--trigger needs --agent")
+                problems.append("--watch/--tick need --agent")
                 return False
-            data.setdefault("agents", {}).setdefault(args.agent, _blank_agent())[
-                "trigger"
-            ] = args.trigger
+            block = data.setdefault("agents", {}).setdefault(args.agent, _blank_agent())
+            if args.watch is not None:
+                block["watch"] = args.watch
+            if args.tick is not None:
+                # "none" clears the backstop; anything else is the schedule.
+                block["tick"] = None if args.tick.lower() == "none" else args.tick
+            if not block.get("watch") and not block.get("tick"):
+                problems.append(
+                    f"{args.agent} would have no way to wake: turn on --watch or set --tick"
+                )
+                return False
         if args.agent:
             state.touch(data, args.agent, status=args.status, note=args.note)
         if args.claim:
@@ -214,7 +235,17 @@ def cmd_set(args: argparse.Namespace) -> int:
 
 
 def _blank_agent() -> dict[str, Any]:
-    return {"status": "paused", "trigger": "tick", "heartbeat": None, "chat_cursor": 0, "note": ""}
+    from .templates import blank_agent
+
+    return blank_agent()
+
+
+def _duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
 
 
 # --------------------------------------------------------------------------- wait
@@ -354,6 +385,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.add_argument("--get", metavar="PATH", help="print one dotted key")
     p.add_argument("--turn", metavar="AGENT", help="exit 0 if it is AGENT's turn")
+    p.add_argument(
+        "--stalled",
+        action="store_true",
+        help="exit 0 if the baton has waited past stall_after_seconds (a missed handoff)",
+    )
     p.set_defaults(func=cmd_status)
 
     p = subs.add_parser("set", parents=[common], help="move the baton or change config")
@@ -373,7 +409,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--enabled", choices=("true", "false"))
     p.add_argument("--workflow", choices=sorted(PHASES))
     p.add_argument("--role", action="append", metavar="ROLE=AGENT", help="assign a role")
-    p.add_argument("--trigger", choices=("tick", "watch"), help="for --agent")
+    p.add_argument(
+        "--watch",
+        dest="watch",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="for --agent: react to handoffs via `cordboard wait` (the default)",
+    )
+    p.add_argument(
+        "--tick",
+        help="for --agent: backstop schedule, or `none` to drop it",
+    )
     p.add_argument("--key", help="dotted path for an arbitrary set")
     p.add_argument("--value", help="value for --key")
     p.add_argument("--force", action="store_true", help="bypass the guards")

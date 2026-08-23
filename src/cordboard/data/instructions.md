@@ -15,10 +15,9 @@ A running board is described by two independent settings in `status.json`:
 | Axis | Field | Values | Chooses |
 |---|---|---|---|
 | **Workflow** | `workflow` | `relay` \| `redline` | Which phase graph is in play — who holds the pen |
-| **Trigger** | `agents.<name>.trigger` | `tick` \| `watch` | How that agent is woken. **Per agent**, not global |
+| **Wake** | `agents.<name>.watch` + `.tick` | bool + schedule | How that agent finds out. **Per agent**, not global |
 
-They compose freely. `redline`, with the reviewer on `watch` and the author on `tick`, is the
-intended default.
+They compose freely. `redline`, with both agents watching, is the intended default.
 
 There is no third "mode" axis. A board where both roles point at one agent *is* the solo
 configuration — see Roles below.
@@ -32,8 +31,8 @@ Two roles, mapped to agents by `roles` in `status.json`:
 ```json
 "roles": { "reviewer": "cc", "author": "ag" },
 "agents": {
-  "cc": { "status": "paused", "trigger": "watch", "heartbeat": null, "chat_cursor": 0, "note": "" },
-  "ag": { "status": "paused", "trigger": "tick",  "heartbeat": null, "chat_cursor": 0, "note": "" }
+  "cc": { "status": "paused", "watch": true, "tick": "*/20 * * * *", "heartbeat": null },
+  "ag": { "status": "paused", "watch": true, "tick": "*/20 * * * *", "heartbeat": null }
 }
 ```
 
@@ -86,19 +85,41 @@ one machine's runtime state. Committing `status.json` would mean merge conflicts
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "enabled": false,
   "workflow": "redline",
   "auto_commit": true,
   "max_rounds": 3,
   "lease_seconds": 5400,
+  "stall_after_seconds": 600,
   "rev": 0,
-  "roles": { "reviewer": "cc", "author": "ag" },
-  "agents": {
-    "cc": { "status": "paused", "trigger": "watch", "heartbeat": null, "chat_cursor": 0, "note": "" },
-    "ag": { "status": "paused", "trigger": "tick", "heartbeat": null, "chat_cursor": 0, "note": "" }
+  "roles": {
+    "reviewer": "cc",
+    "author": "ag"
   },
-  "lock": { "holder": null, "acquired_at": null, "expires_at": null },
+  "agents": {
+    "cc": {
+      "status": "paused",
+      "watch": true,
+      "tick": "*/20 * * * *",
+      "heartbeat": null,
+      "chat_cursor": 0,
+      "note": ""
+    },
+    "ag": {
+      "status": "paused",
+      "watch": true,
+      "tick": "*/20 * * * *",
+      "heartbeat": null,
+      "chat_cursor": 0,
+      "note": ""
+    }
+  },
+  "lock": {
+    "holder": null,
+    "acquired_at": null,
+    "expires_at": null
+  },
   "task": {
     "id": null,
     "title": null,
@@ -108,7 +129,11 @@ one machine's runtime state. Committing `status.json` would mean merge conflicts
     "plan_file": null,
     "last_redline": null,
     "verdict": null,
-    "round": { "plan": 0, "impl": 0 }
+    "handoff_at": null,
+    "round": {
+      "plan": 0,
+      "impl": 0
+    }
   },
   "updated_at": null,
   "updated_by": "user"
@@ -121,7 +146,10 @@ one machine's runtime state. Committing `status.json` would mean merge conflicts
 | `workflow` | `relay` or `redline` — which phase graph applies. |
 | `rev` | Bumped on every write. The compare-and-swap reads it; never set it by hand. |
 | `roles` | Role → agent name. Both roles must be filled for the board to run. |
-| `agents.<name>.trigger` | `tick` or `watch`, per agent. |
+| `agents.<name>.watch` | Whether this agent reacts to handoffs via `cordboard wait`. Default true. |
+| `agents.<name>.tick` | Backstop schedule, or null. An agent needs at least one of these two. |
+| `task.handoff_at` | When the current phase was entered — what a stall is measured from. |
+| `stall_after_seconds` | How long the baton may wait before the handoff counts as missed. |
 | `agents.<name>.chat_cursor` | Line count of `chat.md` this agent has read. |
 | `agents.<name>.note` | Free text from that agent's last tick — where a blocked agent says why. |
 | `lock` | The work lease. An expired lease is stealable; that is the crash recovery. |
@@ -156,7 +184,7 @@ compare-and-swap. Hand-editing races with a live agent and silently loses writes
 |---|---|
 | `cordboard status` | Read state. `--json`, `--get task.phase`, `--turn <agent>` (exit 0 = its turn) |
 | `cordboard set` | Write state. Refuses out-of-turn moves and illegal transitions unless `--force` |
-| `cordboard wait <agent>` | Block until it is that agent's turn. The `watch` trigger |
+| `cordboard wait <agent>` | Block until it is that agent's turn. This is `watch` |
 | `cordboard say` | Append to / read the chat back-channel |
 | `cordboard init` | Create a board, or `--migrate` a v2 one |
 | `cordboard spec` | Print this document |
@@ -367,14 +395,38 @@ Rules:
 
 ## Triggers
 
-### `tick` — clock-driven
+`watch` and `tick` are **not alternatives**. Watch is how a handoff is noticed; tick is the backstop
+that catches one the watcher slept through. A healthy agent has both.
 
-A cron or timer fires the agent on a schedule, whatever the workflow. Two agents both on `tick`
-should have **offset** schedules — `5,35` and `20,50` — so a handoff lands in the gap instead of both
-waking at once. The lock and CAS make a simultaneous pair safe; offsetting just wastes fewer ticks.
+### `watch` — primary, and the default
 
-The cost of `tick` is latency: a handoff waits for the next scheduled wake, so half the interval on
-average.
+`cordboard wait <agent>` blocks until the baton is that agent's, then exits. A handoff is picked up
+in seconds.
+
+### `tick` — the backstop
+
+A cron or timer runs the same tick prompt on a schedule. Its job is not to drive the loop; it is to
+notice that the loop did not move. Watchers fail in ordinary ways — a session ends, a host does not
+re-invoke, a process is killed — and none of those announce themselves. Without a tick behind it, a
+dropped watcher is indistinguishable from an idle board.
+
+Keep it **slow**; `*/20` is the default. A fast backstop is polling with extra steps, and it hides
+the very failure it exists to reveal.
+
+**An agent with neither is unreachable**, and `cordboard set` refuses to leave one that way.
+
+### Telling a caught handoff from a routine wake
+
+Every phase change stamps `task.handoff_at`. A watching agent claims within seconds, so a baton that
+has sat longer than `stall_after_seconds` (default 600) means the wake never arrived:
+
+```bash
+cordboard status --stalled     # exit 0 = this handoff was missed
+```
+
+`cordboard status` also prints the waiting time and flags a stall. A backstop tick that finds this is
+doing the job it exists for; one that finds it *often* means the watcher does not work on this host,
+which is worth knowing before it matters.
 
 ### `watch` — state-driven
 
@@ -393,8 +445,8 @@ How you wire that up depends on the host:
 - **A host that re-invokes the agent when a background command exits** can run `cordboard wait` in the
   background and treat the exit as the event. The tick then ends by re-arming the watcher.
 - **A host with a blocking foreground call** can run `cordboard wait` directly and act when it returns.
-- **A host with neither** stays on `tick`. Because `trigger` is per agent, a mixed `watch`/`tick` pair
-  is a normal configuration, not a compromise.
+- **A host with neither** sets `watch: false` and relies on its tick alone. Because both fields are
+  per agent, a mixed pair is a normal configuration rather than a compromise.
 
 **Keep a slow `tick` armed alongside `watch`** (hourly is plenty) as a heartbeat, so a dropped
 watcher degrades to slow rather than dead.
@@ -468,17 +520,26 @@ agent — a cron entry, a recurring timer, a wrapper script:
 Reading the back-channel **first** is part of the algorithm: a message from the other agent may
 change how you handle the phase you are about to act on.
 
-### Arming a `watch` agent
+### Arming the watcher — for both agents
 
 > Read `cordboard/instructions.md`, then run `cordboard status`. If the board is enabled, start
 > `cordboard wait <agent-name>` in the background and report the state back to me. When it exits 0,
 > run the tick for the current phase, then re-arm the watcher.
 
-### Arming a `tick` agent
+Exit 11 (timeout) means re-arm and keep waiting. Exit 10 means the board was disabled: stand down,
+and do **not** re-arm.
 
-Schedule the tick prompt on a recurring timer. When both agents are on `tick`, **offset their
-schedules** — `5,35` and `20,50` — so a handoff lands in the gap rather than both waking together.
-The lock and CAS make simultaneous ticks safe, but offset ones waste less.
+### Arming the backstop — also for both agents
+
+Schedule the tick prompt at the agent's `tick`. It runs the same algorithm, so most of the time it
+finds nothing to do and costs one cheap wake. When it *does* find work waiting,
+`cordboard status --stalled` exits 0: the watcher missed that handoff, and the agent should say so in
+its `note`. Those notes are the only record you get that `watch` is unreliable on this host.
+
+An agent with `watch: false` has no watcher to back up — its tick is the whole mechanism, so tighten
+the schedule, and offset it (`5,35` vs `20,50`) against any other non-watching agent so a handoff
+lands in the gap rather than both waking together. The lock and CAS make a simultaneous pair safe;
+offsetting just wastes fewer ticks.
 
 ### Go live
 
