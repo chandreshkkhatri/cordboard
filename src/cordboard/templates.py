@@ -87,8 +87,9 @@ def blank_board(workflow: str, reviewer: str, author: str) -> dict[str, Any]:
 
 STACK_TEMPLATE = """# Task stack
 
-**LIFO — the bottom-most task is picked first.** Add new work at the bottom; the agents pop from
-there. Keep each entry to one line plus optional indented notes; anything longer belongs in a plan.
+**LIFO — the bottom-most task is picked first.** Add new work at the bottom; `cordboard task start`
+picks it and `cordboard task complete` checks it off. Keep each entry to one line plus optional
+indented notes; anything longer belongs in a plan.
 
 Format: `- [ ] <short-id> — <what needs to be true when this is done>`
 
@@ -101,6 +102,8 @@ GITIGNORE_TEMPLATE = """# cordboard runtime state — the board is local, the sp
 status.json
 status.json.*.bak
 .status.lock
+.chat.lock
+.todo.lock
 chat.md
 chat.*.md
 plans/

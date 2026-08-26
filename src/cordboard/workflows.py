@@ -16,7 +16,7 @@ VERDICTS = ("approve", "revise", "reject")
 # are the two states only a human moves the baton out of.
 #
 # ``done`` is *not* terminal. It is the bookkeeping beat where the agent that
-# finished commits, pops the task off the stack, and queues the next one.
+# finished commits, checks off the task, and queues the next one.
 #
 # An "in progress" phase is owned by the role that entered it, so an agent that
 # died mid-phase resumes its own work instead of handing over something half done.

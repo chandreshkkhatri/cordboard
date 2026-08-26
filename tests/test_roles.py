@@ -61,12 +61,16 @@ def test_disabled_board_is_nobody_s_turn(board):
 
 def test_unassigned_role_is_an_error_not_a_default(board):
     """Guessing an agent name here would hand the baton to a session nobody armed."""
-    state.update(board, lambda d: d["roles"].pop("author"))
+    damaged = state.load(board)
+    damaged["roles"].pop("author")
+    state.write_atomic(board, damaged)
     with pytest.raises(state.StateError, match="unassigned"):
         roles.role_map(state.load(board))
 
 
 def test_unknown_phase_is_rejected(board):
-    state.update(board, lambda d: d["task"].update({"phase": "awaiting_plan"}))  # relay-only
+    damaged = state.load(board)
+    damaged["task"]["phase"] = "awaiting_plan"  # relay-only
+    state.write_atomic(board, damaged)
     with pytest.raises(state.StateError, match="not part of"):
         roles.owner(state.load(board))

@@ -10,7 +10,7 @@ import json
 import os
 import re
 
-from cordboard import cli
+from cordboard import SCHEMA_VERSION, __version__, cli
 from cordboard.templates import blank_board
 from cordboard.workflows import PHASES
 
@@ -42,6 +42,14 @@ def test_documented_schema_matches_a_fresh_board():
     assert _keys(documented) == _keys(actual)
     for field in ("version", "enabled", "workflow", "max_rounds", "lease_seconds", "auto_commit"):
         assert documented[field] == actual[field], field
+
+
+def test_spec_heading_and_package_metadata_versions_match():
+    assert f"schema v{SCHEMA_VERSION}" in spec_text().splitlines()[0]
+    with open(os.path.join(_ROOT, "pyproject.toml"), encoding="utf-8") as handle:
+        match = re.search(r'^version = "([^"]+)"$', handle.read(), re.M)
+    assert match
+    assert match.group(1) == __version__
 
 
 def test_every_subcommand_is_documented():

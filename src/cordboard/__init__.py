@@ -11,4 +11,4 @@ from .state import SCHEMA_VERSION, StateError
 
 __all__ = ["SCHEMA_VERSION", "StateError", "__version__"]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
