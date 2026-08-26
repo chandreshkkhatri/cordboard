@@ -14,7 +14,7 @@ import sys
 import time
 from typing import Any
 
-from . import chat, roles, state
+from . import chat, roles, state, tasks
 from .templates import init_board, migrate_v2
 from .workflows import PHASES, ROLES, VERDICTS
 
@@ -54,9 +54,16 @@ def _coerce(raw: str) -> Any:
 
 def _assign(data: dict[str, Any], dotted: str, value: Any) -> None:
     parts = dotted.split(".")
+    if not all(parts):
+        raise state.StateError(f"invalid dotted path {dotted!r}")
     cursor = data
     for part in parts[:-1]:
-        cursor = cursor.setdefault(part, {})
+        child = cursor.setdefault(part, {})
+        if not isinstance(child, dict):
+            raise state.StateError(
+                f"cannot set {dotted!r}: {part!r} already contains a non-object value"
+            )
+        cursor = child
     cursor[parts[-1]] = value
 
 
@@ -107,7 +114,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(value if isinstance(value, str) else json.dumps(value))
         return 0
     if args.json:
-        print(json.dumps(data, indent=2))
+        output = dict(data)
+        output["_task_stack"] = tasks.summary(root)
+        print(json.dumps(output, indent=2))
         return 0
 
     print(roles.describe(data))
@@ -133,6 +142,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     if lock.get("holder"):
         stale = " (EXPIRED)" if state.lease_expired(data) else ""
         print(f"  lease held by {lock['holder']} until {lock.get('expires_at')}{stale}")
+    stack = tasks.summary(root)
+    next_id = (stack["next"] or {}).get("id") or "—"
+    print(
+        f"  queue pending={stack['pending']} completed={stack['completed']} next={next_id}"
+    )
     return 0
 
 
@@ -212,9 +226,9 @@ def cmd_set(args: argparse.Namespace) -> int:
             if not args.agent:
                 problems.append("--claim needs --agent")
                 return False
-            state.claim_lease(data, args.agent)
+            state.claim_lease(data, args.agent, force=args.force)
         if args.release:
-            state.release_lease(data)
+            state.release_lease(data, args.agent, force=args.force)
         if args.key:
             _assign(data, args.key, _coerce(args.value))
         return None
@@ -316,31 +330,124 @@ def cmd_say(args: argparse.Namespace) -> int:
     root = _root(args)
 
     if args.read:
-        data = state.load(root)
-        text, cursor = chat.unread(root, data, args.read)
+        text, _ = chat.consume(root, args.read, peek=args.peek)
         print(text or f"(no new chat for {args.read})")
-        if not args.peek:
-            state.update(
-                root,
-                lambda d: d.setdefault("agents", {})
-                .setdefault(args.read, _blank_agent())
-                .update({"chat_cursor": cursor}),
-                actor=args.read,
-            )
         return 0
 
     if not (args.sender and args.to and args.body):
         print("cordboard: need SENDER TO BODY, or --read AGENT", file=sys.stderr)
         return EXIT_REFUSED
 
+    data = state.load(root)
     task_id = args.task
     if task_id is None:
-        try:
-            task_id = state.task(state.load(root)).get("id")
-        except state.StateError:
-            task_id = None
+        task_id = state.task(data).get("id")
     print(chat.append(root, args.sender, args.to, args.body, task_id, args.ref))
     return 0
+
+
+# --------------------------------------------------------------------------- task
+
+
+def cmd_task(args: argparse.Namespace) -> int:
+    root = _root(args)
+    if args.action == "list":
+        entries = tasks.read(root)
+        next_up = tasks.next_pending(root)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": item.id,
+                                "title": item.title,
+                                "done": item.done,
+                                "line": item.line,
+                                "next": bool(next_up and item.id == next_up.id),
+                            }
+                            for item in entries
+                        ],
+                        "summary": tasks.summary(root),
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+        if not entries:
+            print("(task stack is empty)")
+            return 0
+        for item in entries:
+            marker = "x" if item.done else " "
+            suffix = "  ← next" if next_up and item.id == next_up.id else ""
+            print(f"- [{marker}] {item.id} — {item.title}{suffix}")
+        return 0
+
+    if args.action == "complete":
+        data = state.load(root)
+        current = state.task(data)
+        if state.phase(data) != "done" or not current.get("id"):
+            print("cordboard: only an active task in phase=done can be completed", file=sys.stderr)
+            return EXIT_REFUSED
+        changed = tasks.complete(root, str(current["id"]))
+        word = "completed" if changed else "already completed"
+        print(f"cordboard: {word} {current['id']}")
+        if args.next and tasks.next_pending(root) is not None:
+            return _start_next_task(root)
+        if args.next:
+            print("cordboard: task stack is empty")
+        _park_completed_task(root, str(current["id"]))
+        return 0
+
+    return _start_next_task(root)
+
+
+def _start_next_task(root: str) -> int:
+    problems: list[str] = []
+
+    def start(data: dict[str, Any]) -> Any:
+        current = state.phase(data)
+        if current not in {"idle", "done"}:
+            problems.append(f"cannot start a task while phase={current}; finish or park it first")
+            return False
+        item = tasks.next_pending(root)
+        if item is None:
+            problems.append("no pending task in TODO.md")
+            return False
+        data["task"] = {
+            "id": item.id,
+            "title": item.title,
+            "kind": "implement",
+            "phase": roles.entry_phase(data),
+            "dir": None,
+            "plan_file": None,
+            "last_redline": None,
+            "verdict": None,
+            "handoff_at": None,
+            "round": {"plan": 0, "impl": 0},
+        }
+        return None
+
+    data, written = state.update(root, start, actor="user")
+    if not written:
+        for problem in problems:
+            print(f"cordboard: {problem}", file=sys.stderr)
+        return EXIT_REFUSED
+    current = state.task(data)
+    print(f"cordboard: started {current['id']} — {current['title']}")
+    return 0
+
+
+def _park_completed_task(root: str, task_id: str) -> None:
+    """Leave an enabled board quiet when completion did not start a successor."""
+    def park(data: dict[str, Any]) -> Any:
+        current = state.task(data)
+        if state.phase(data) != "done" or current.get("id") != task_id:
+            raise state.StateError(f"task {task_id!r} changed while it was being completed")
+        current["phase"] = "idle"
+        return None
+
+    state.update(root, park, actor="user")
 
 
 # --------------------------------------------------------------------------- spec
@@ -351,6 +458,29 @@ def cmd_spec(args: argparse.Namespace) -> int:
     here = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(here, "data", "instructions.md"), encoding="utf-8") as handle:
         sys.stdout.write(handle.read())
+    return 0
+
+
+# --------------------------------------------------------------------------- doctor
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    root = _root(args)
+    data = state.load(root)
+    problems = state.validation_errors(data)
+    try:
+        tasks.read(root)
+    except state.StateError as exc:
+        problems.append(str(exc))
+    if problems:
+        print(f"cordboard: found {len(problems)} problem(s)", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        return EXIT_BAD_STATE
+    print(
+        f"cordboard: healthy — schema v{data['version']}, rev {data['rev']}, "
+        f"{len(tasks.read(root))} task(s)"
+    )
     return 0
 
 
@@ -404,8 +534,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note")
     p.add_argument("--verdict", choices=VERDICTS)
     p.add_argument("--bump-round", choices=("plan", "impl"), dest="bump_round")
-    p.add_argument("--claim", action="store_true", help="take the work lease")
-    p.add_argument("--release", action="store_true", help="drop the work lease")
+    lease = p.add_mutually_exclusive_group()
+    lease.add_argument("--claim", action="store_true", help="take the work lease")
+    lease.add_argument("--release", action="store_true", help="drop the work lease")
     p.add_argument("--enabled", choices=("true", "false"))
     p.add_argument("--workflow", choices=sorted(PHASES))
     p.add_argument("--role", action="append", metavar="ROLE=AGENT", help="assign a role")
@@ -443,8 +574,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--peek", action="store_true", help="with --read: leave the cursor")
     p.set_defaults(func=cmd_say)
 
+    p = subs.add_parser("task", parents=[common], help="inspect or advance the TODO stack")
+    p.add_argument("action", choices=("list", "start", "complete"))
+    p.add_argument("--next", action="store_true", help="with complete: start the next task")
+    p.add_argument("--json", action="store_true", help="with list: emit structured output")
+    p.set_defaults(func=cmd_task)
+
     p = subs.add_parser("spec", parents=[common], help="print the protocol spec agents follow")
     p.set_defaults(func=cmd_spec)
+
+    p = subs.add_parser("doctor", parents=[common], help="validate board state and the TODO stack")
+    p.set_defaults(func=cmd_doctor)
 
     return parser
 
@@ -454,13 +594,61 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "set" and args.key and args.value is None:
         print("cordboard: --key needs --value", file=sys.stderr)
         return EXIT_REFUSED
+    if args.command == "set" and not _set_has_action(args):
+        print("cordboard: set needs an action", file=sys.stderr)
+        return EXIT_REFUSED
+    if args.command == "wait" and (args.timeout < 0 or args.interval <= 0):
+        print("cordboard: wait needs --timeout >= 0 and --interval > 0", file=sys.stderr)
+        return EXIT_REFUSED
+    if args.command == "say":
+        if args.read and any((args.sender, args.to, args.body)):
+            print("cordboard: --read cannot be combined with a message", file=sys.stderr)
+            return EXIT_REFUSED
+        if args.peek and not args.read:
+            print("cordboard: --peek needs --read", file=sys.stderr)
+            return EXIT_REFUSED
+    if args.command == "task" and args.next and args.action != "complete":
+        print("cordboard: --next is only valid with task complete", file=sys.stderr)
+        return EXIT_REFUSED
+    if args.command == "task" and args.json and args.action != "list":
+        print("cordboard: --json is only valid with task list", file=sys.stderr)
+        return EXIT_REFUSED
     try:
         return int(args.func(args))
     except state.StateError as exc:
         print(f"cordboard: {exc}", file=sys.stderr)
         return EXIT_BAD_STATE
+    except OSError as exc:
+        detail = f"{exc.strerror or str(exc)}"
+        if exc.filename:
+            detail += f": {exc.filename}"
+        print(f"cordboard: {detail}", file=sys.stderr)
+        return EXIT_BAD_STATE
     except KeyboardInterrupt:
         return 130
+
+
+def _set_has_action(args: argparse.Namespace) -> bool:
+    """Whether `set` will do more than bump the revision."""
+    return any(
+        (
+            args.agent,
+            args.phase,
+            args.start,
+            args.status,
+            args.note is not None,
+            args.verdict,
+            args.bump_round,
+            args.claim,
+            args.release,
+            args.enabled is not None,
+            args.workflow,
+            args.role,
+            args.watch is not None,
+            args.tick is not None,
+            args.key,
+        )
+    )
 
 
 if __name__ == "__main__":

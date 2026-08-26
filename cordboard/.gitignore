@@ -1,0 +1,9 @@
+# cordboard runtime state — the board is local, the spec is shared
+status.json
+status.json.*.bak
+.status.lock
+.chat.lock
+.todo.lock
+chat.md
+chat.*.md
+plans/

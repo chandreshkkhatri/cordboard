@@ -23,8 +23,8 @@ Once published, `uvx cordboard` / `pipx run cordboard` will work without an inst
 cd /your/repo
 cordboard init                 # writes ./cordboard/
 $EDITOR cordboard/TODO.md      # queue work; the bottom entry runs first
-cordboard set --start          # hand the baton to the first phase
 cordboard set --enabled true
+cordboard task start           # install the bottom task and hand off its first phase
 cordboard status               # whose turn is it
 ```
 
@@ -95,15 +95,21 @@ reader never sees a partial file. A separate lease (`lock.holder`, with an expir
 phase, and an expired lease is stealable — which is what makes a crashed agent recoverable without a
 human.
 
+At `done`, `cordboard task complete --next` checks off the active TODO entry and starts the next
+bottom-most pending item, or parks the board at `idle` when the queue is empty. If execution is
+interrupted between the check-off and handoff, rerunning completion is safe.
+
 ## Commands
 
 | Command | Purpose |
 |---|---|
 | `cordboard init` | Create a board. `--migrate` imports a v2 board. |
-| `cordboard status` | Read it. `--json`, `--get task.phase`, `--turn <agent>` (exit 0 = its turn). |
+| `cordboard status` | Read state and queue context. `--json` includes computed `_task_stack`. |
 | `cordboard set` | Move the baton or change config. `--start` kicks off; `--force` overrides a guard. |
 | `cordboard wait <agent>` | Block until it is that agent's turn. Exit `0`/`10`/`11`/`2`. |
 | `cordboard say` | Append to or read the back-channel. |
+| `cordboard task list\|start\|complete` | Inspect (`list --json`) or advance the LIFO stack. |
+| `cordboard doctor` | Validate board state and the TODO stack without writing. |
 | `cordboard spec` | Print the protocol spec the agents follow. |
 
 `cordboard spec` is the whole protocol: the phase graphs, both tick algorithms, the redline comment
@@ -124,6 +130,9 @@ cordboard/
   status.json       The baton.                         local
   chat.md           Agent back-channel.                local
   plans/<task-id>/  plan.md + redline-*.md per task.   local
+  .status.lock      State update lock.                 local
+  .chat.lock        Chat append/rotation lock.         local
+  .todo.lock        Task completion lock.              local
 ```
 
 The spec and the stack are shared facts about the work. The baton is one machine's runtime state —
@@ -132,7 +141,7 @@ committing it would mean a merge conflict on every handoff.
 ## Development
 
 ```bash
-.venv/bin/python -m pytest      # 53 tests
+.venv/bin/python -m pytest      # run the test suite
 .venv/bin/python -m ruff check .
 ```
 
@@ -147,8 +156,7 @@ the package is new: the phase machine, guards, CAS and migration are covered by 
 `watch` trigger's integration with any *particular* agent host is not — that depends on whether the
 host re-invokes an agent when a background process exits.
 
-`requires-python` says 3.10, which is a syntax claim: CI does not yet run the suite on anything but
-3.14.
+CI runs the suite and lint on every supported Python version, from 3.10 through 3.14.
 
 `cordboard init --migrate` moves an in-flight v2 board across without losing the task.
 

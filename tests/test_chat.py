@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from cordboard import chat, state
 
@@ -54,3 +56,33 @@ def test_a_rotated_log_rereads_rather_than_skipping(board):
     state.update(board, lambda d: d["agents"]["ag"].update({"chat_cursor": 9999}))
     text, _ = chat.unread(board, state.load(board), "ag")
     assert "after rotation" in text
+
+
+def test_concurrent_writes_preserve_messages_when_rotation_is_deferred(board, monkeypatch):
+    """Unread agents make the size threshold soft, never lossy."""
+    monkeypatch.setattr(chat, "ROTATE_BYTES", 1)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda i: chat.append(board, "cc", "ag", f"rotating-{i}"), range(24)))
+
+    combined = "".join(path.read_text() for path in Path(board).glob("chat*.md"))
+    assert combined.count("## ") == 24
+    for i in range(24):
+        assert f"rotating-{i}\n" in combined
+
+
+def test_rotation_waits_for_all_readers_and_resets_equal_length_cursors(board, monkeypatch):
+    monkeypatch.setattr(chat, "ROTATE_BYTES", 1)
+    chat.append(board, "cc", "ag", "before-rotation")
+    chat.append(board, "cc", "ag", "still-before-rotation")
+    assert not list(Path(board).glob("chat.*.md")), "unread messages must defer rotation"
+
+    for agent in ("cc", "ag"):
+        text, _ = chat.consume(board, agent)
+        assert "before-rotation" in text
+
+    chat.append(board, "cc", "ag", "after-rotation")
+    assert list(Path(board).glob("chat.*.md"))
+    text, _ = chat.consume(board, "ag")
+    assert "after-rotation" in text
+    assert "before-rotation" not in text

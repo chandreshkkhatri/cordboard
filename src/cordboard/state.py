@@ -100,6 +100,94 @@ def load(root: str) -> dict[str, Any]:
     return data
 
 
+def validation_errors(data: dict[str, Any]) -> list[str]:
+    """Return schema and safety violations without mutating the board."""
+    from .workflows import PHASES, ROLES, VERDICTS
+
+    errors: list[str] = []
+    if data.get("version") != SCHEMA_VERSION:
+        errors.append(
+            f"version must be {SCHEMA_VERSION}, got {data.get('version')!r}; "
+            "run `cordboard init --migrate`"
+        )
+    if not isinstance(data.get("enabled"), bool):
+        errors.append("enabled must be true or false")
+
+    flow = data.get("workflow")
+    if flow not in PHASES:
+        errors.append(f"workflow must be one of {sorted(PHASES)}, got {flow!r}")
+
+    for key in ("max_rounds", "lease_seconds", "stall_after_seconds"):
+        value = data.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"{key} must be a positive integer")
+    revision = data.get("rev")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        errors.append("rev must be a non-negative integer")
+
+    mapping = data.get("roles")
+    agents_block = data.get("agents")
+    if not isinstance(mapping, dict):
+        errors.append("roles must be an object")
+        mapping = {}
+    if not isinstance(agents_block, dict):
+        errors.append("agents must be an object")
+        agents_block = {}
+    for role in ROLES:
+        agent = mapping.get(role)
+        if not isinstance(agent, str) or not agent:
+            errors.append(f"roles.{role} must name an agent")
+        elif agent not in agents_block:
+            errors.append(f"roles.{role} names missing agent {agent!r}")
+    for name, block in agents_block.items():
+        if not isinstance(block, dict):
+            errors.append(f"agents.{name} must be an object")
+            continue
+        watch = block.get("watch")
+        tick = block.get("tick")
+        if not isinstance(watch, bool):
+            errors.append(f"agents.{name}.watch must be true or false")
+        if tick is not None and (not isinstance(tick, str) or not tick.strip()):
+            errors.append(f"agents.{name}.tick must be a schedule string or null")
+        if watch is False and not tick:
+            errors.append(f"agents.{name} has neither watch nor tick and cannot wake")
+
+    lock = data.get("lock")
+    if not isinstance(lock, dict):
+        errors.append("lock must be an object")
+    else:
+        holder = lock.get("holder")
+        if holder is not None and holder not in agents_block:
+            errors.append(f"lock.holder names missing agent {holder!r}")
+
+    task_block = data.get("task")
+    if not isinstance(task_block, dict):
+        errors.append("task must be an object")
+    else:
+        current = task_block.get("phase")
+        if flow in PHASES and current not in PHASES[flow]:
+            errors.append(f"task.phase {current!r} is not part of workflow {flow!r}")
+        verdict = task_block.get("verdict")
+        if verdict is not None and verdict not in VERDICTS:
+            errors.append(f"task.verdict must be one of {VERDICTS} or null")
+        rounds = task_block.get("round")
+        if not isinstance(rounds, dict):
+            errors.append("task.round must be an object")
+        else:
+            for gate in ("plan", "impl"):
+                value = rounds.get(gate)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    errors.append(f"task.round.{gate} must be a non-negative integer")
+    return errors
+
+
+def validate(data: dict[str, Any]) -> None:
+    """Raise one actionable error containing every known board violation."""
+    errors = validation_errors(data)
+    if errors:
+        raise StateError("invalid board: " + "; ".join(errors))
+
+
 def write_atomic(root: str, data: dict[str, Any]) -> None:
     """Replace the state file in one step, so a reader never sees a partial write."""
     path = status_path(root)
@@ -156,6 +244,7 @@ def update(
                 draft["rev"] = base_rev + 1
                 draft["updated_at"] = now()
                 draft["updated_by"] = actor
+                validate(draft)
                 write_atomic(root, draft)
                 return draft, True
             finally:
@@ -179,8 +268,21 @@ def lease_expired(data: dict[str, Any]) -> bool:
     return datetime.now(timezone.utc) >= deadline
 
 
-def claim_lease(data: dict[str, Any], agent: str, seconds: int | None = None) -> None:
-    """Take the work lease. Call inside :func:`update`."""
+def claim_lease(
+    data: dict[str, Any],
+    agent: str,
+    seconds: int | None = None,
+    *,
+    force: bool = False,
+) -> None:
+    """Take or renew the work lease. Call inside :func:`update`.
+
+    A live lease belongs to its holder. Another agent may only take it after it
+    expires, or when an operator has deliberately requested a forced recovery.
+    """
+    holder = (data.get("lock") or {}).get("holder")
+    if holder and holder != agent and not lease_expired(data) and not force:
+        raise StateError(f"lease is held by {holder!r}; wait for expiry or use --force")
     ttl = seconds or int(data.get("lease_seconds") or DEFAULT_LEASE_SECONDS)
     start = datetime.now(timezone.utc)
     data["lock"] = {
@@ -192,7 +294,16 @@ def claim_lease(data: dict[str, Any], agent: str, seconds: int | None = None) ->
     }
 
 
-def release_lease(data: dict[str, Any]) -> None:
+def release_lease(
+    data: dict[str, Any], agent: str | None = None, *, force: bool = False
+) -> None:
+    """Release a lease, refusing an agent that does not own a live one.
+
+    ``agent=None`` is the human/operator path and remains available for recovery.
+    """
+    holder = (data.get("lock") or {}).get("holder")
+    if agent and holder and holder != agent and not lease_expired(data) and not force:
+        raise StateError(f"lease is held by {holder!r}; only its holder may release it")
     data["lock"] = {"holder": None, "acquired_at": None, "expires_at": None}
 
 

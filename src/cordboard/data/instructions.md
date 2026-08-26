@@ -1,4 +1,4 @@
-# cordboard — protocol specification (schema v3)
+# cordboard — protocol specification (schema v4)
 
 This document defines the coordination protocol, state machine, and safety rules that let two
 coding agents work a shared task backlog without stepping on each other.
@@ -72,6 +72,8 @@ cordboard/
   chat.md                Agent back-channel. Local.
   plans/<task-id>/       Per-task plan + redlines. Local.
   .status.lock           flock target. Local.
+  .chat.lock             chat rotation lock. Local.
+  .todo.lock             task completion lock. Local.
 ```
 
 The split is deliberate: the spec and the stack are shared facts about the work, and the baton is
@@ -182,10 +184,12 @@ compare-and-swap. Hand-editing races with a live agent and silently loses writes
 
 | Command | Purpose |
 |---|---|
-| `cordboard status` | Read state. `--json`, `--get task.phase`, `--turn <agent>` (exit 0 = its turn) |
+| `cordboard status` | Read state and queue summary. `--json` adds computed `_task_stack` context |
 | `cordboard set` | Write state. Refuses out-of-turn moves and illegal transitions unless `--force` |
 | `cordboard wait <agent>` | Block until it is that agent's turn. This is `watch` |
 | `cordboard say` | Append to / read the chat back-channel |
+| `cordboard task list\|start\|complete` | Inspect (`list --json`) or advance the LIFO task stack |
+| `cordboard doctor` | Validate board state and the TODO stack without writing |
 | `cordboard init` | Create a board, or `--migrate` a v2 one |
 | `cordboard spec` | Print this document |
 
@@ -228,7 +232,7 @@ awaiting_plan ─(reviewer)─▶ planning ─(reviewer)─▶ plan_ready ─(au
                                                                               ▼
    done ◀─ clean ─ reviewing ◀─(reviewer)─ awaiting_review ◀────────────────────┘
     │                  │
- (pop TODO)         issues ─▶ writes a fix-plan ─▶ plan_ready
+ (complete task)    issues ─▶ writes a fix-plan ─▶ plan_ready
     ▼
 awaiting_plan (next) / idle
 ```
@@ -239,10 +243,11 @@ awaiting_plan (next) / idle
 | `plan_ready`, `implementing` | author |
 | `blocked`, `idle` | nobody — a human moves the baton out |
 
-**Reviewer tick.** At `awaiting_plan`: pick the bottom-most task from `TODO.md` (split it first if
-it is too large, appending subtasks at the bottom), write `plan.md`, move to `plan_ready`. At
+**Reviewer tick.** At `awaiting_plan`: read the task installed by `cordboard task start` (split it
+first if it is too large, appending subtasks at the bottom), write `plan.md`, move to `plan_ready`. At
 `awaiting_review`: audit `git diff`, run the plan's verification gates; if clean, commit (when
-`auto_commit`) and pop the task; if not, write a fix-plan and return to `plan_ready`.
+`auto_commit`) and run `cordboard task complete --next`; if not, write a fix-plan and return to
+`plan_ready`.
 
 **Author tick.** At `plan_ready`: read `plan.md`, implement, run the plan's verification steps, move
 to `awaiting_review` — or to `blocked` with a note if stuck.
@@ -275,7 +280,7 @@ awaiting_draft ─(author)─▶ drafting ─(author)─▶ plan_submitted
                                      ┌───── verdict=reject ──────────────────────┤
                                      │  (author revises, re-review)               │ approve / revise
                                      ▼                                            ▼
-                              impl_submitted                          done ─(pop TODO)─▶ awaiting_draft / idle
+                              impl_submitted                    done ─(task complete --next)─▶ awaiting_draft / idle
 ```
 
 | Phase | Owner |
@@ -284,14 +289,15 @@ awaiting_draft ─(author)─▶ drafting ─(author)─▶ plan_submitted
 | `plan_submitted`, `plan_redlining`, `impl_submitted`, `impl_redlining` | reviewer |
 | `blocked`, `idle` | nobody — a human moves the baton out |
 
-`done` is not terminal: it is the bookkeeping beat where the finishing agent commits, pops
-`TODO.md`, and queues the next task. `idle` is the resting state.
+`done` is not terminal: it is the bookkeeping beat where the finishing agent commits, runs
+`cordboard task complete --next`, and either queues the next task or rests. `idle` is the resting
+state.
 
 ### Author tick
 
-* **`awaiting_draft`** — claim the lease, move to `drafting`. Pick the bottom-most task from
-  `TODO.md`. Create `cordboard/plans/<task-id>/`, write `plan.md`, set `task.id`, `task.title`,
-  `task.dir`, `task.plan_file`. Move to `plan_submitted`, release.
+* **`awaiting_draft`** — claim the lease, move to `drafting`. Read the task identity installed by
+  `cordboard task start`. Create `cordboard/plans/<task-id>/`, write `plan.md`, set `task.dir` and
+  `task.plan_file`. Move to `plan_submitted`, release.
 * **`plan_redlined`** — claim, read `task.last_redline`. Answer **every** comment in `plan.md` under
   a `## Redline responses` heading (see below), revising the plan accordingly. Then branch on
   `task.verdict`:
@@ -302,8 +308,8 @@ awaiting_draft ─(author)─▶ drafting ─(author)─▶ plan_submitted
   with a note.
 * **`impl_redlined`** — claim, apply the comments in `task.last_redline` to the code. Then:
   * `reject` → back to `impl_submitted` for another round.
-  * `approve` / `revise` → commit (when `auto_commit`), pop the task from `TODO.md`, move to
-    `awaiting_draft` if tasks remain, else `idle`.
+  * `approve` / `revise` → commit (when `auto_commit`), move to `done`, then run
+    `cordboard task complete --next`.
 * **`drafting` / `implementing` found on entry** — watchdog: the previous tick died mid-phase.
   Refresh the heartbeat and resume the same work.
 
@@ -385,11 +391,12 @@ Rules:
 
 - **Advisory only.** Chat never carries baton state. Anything that changes what happens next belongs
   in a redline comment or in `status.json`.
-- **Append-only.** Never rewrite or delete entries. Appends are a single `O_APPEND` write, so
-  concurrent senders are safe without a lock.
+- **Append-only.** Never rewrite or delete entries. A dedicated `.chat.lock` serializes rotation
+  with each `O_APPEND` write, so concurrent senders cannot strand or interleave an entry.
 - **Read first.** Every tick starts with `cordboard say --read <self>`, before acting on the phase.
 - `human` is a valid addressee for things that need operator attention but do not justify `blocked`.
-- The file rotates to `chat.<date>.md` past ~200 KB.
+- The file rotates to `chat.<date>.md` past ~200 KB once every registered agent has consumed it.
+  An unread agent defers rotation, because delivery is more important than the soft size limit.
 
 ---
 
@@ -463,10 +470,11 @@ concurrency control, it is a hope — so there are two real mechanisms, both in 
   file in place atomically. Readers therefore never see a partial file, and a stale writer retries
   instead of clobbering.
 - **Lease lock.** `lock: {holder, acquired_at, expires_at}` is held across a phase via
-  `cordboard set --claim` / `--release`. An **expired** lease is stealable: the other agent may reset the
-  phase to the last stable state, note it, and carry on. That is what makes a crashed agent
-  recoverable without a human, and it works at second-scale as well as at hour-scale. Default TTL is
-  `lease_seconds` (5400).
+  `cordboard set --claim` / `--release`. A live lease may only be renewed or released by its holder
+  unless an operator uses `--force`. An **expired** lease is stealable: the other agent may reset
+  the phase to the last stable state, note it, and carry on. That is what makes a crashed agent
+  recoverable without a human, and it works at second-scale as well as at hour-scale. Default TTL
+  is `lease_seconds` (5400).
 
 ---
 
@@ -480,8 +488,8 @@ queued work). A commit must therefore be **scoped to the task**:
 - **Verify before committing:** `git diff --cached --name-only` must match the task's expected file
   set. If anything unexpected is staged, unstage it (`git restore --staged <file>`).
 - **Never bundle board bookkeeping into a task commit.** `cordboard/status.json`,
-  `cordboard/plans/*` and `cordboard/chat.md` are ignored runtime state, and a `cordboard/TODO.md` pop
-  is board state rather than part of the change — leave those out.
+  `cordboard/plans/*` and `cordboard/chat.md` are ignored runtime state, and a `cordboard/TODO.md`
+  check-off is board bookkeeping rather than part of the implementation — leave those out.
 - **Follow the host repo's commit conventions.** If it has a contributor guide, that governs the
   message. A completed, verified task under `auto_commit` is a self-contained unit of work, which is
   what makes it committable without asking first — anything less finished is not.
@@ -492,6 +500,8 @@ queued work). A commit must therefore be **scoped to the task**:
 
 - `cordboard set --start` moves the baton to the current workflow's entry phase. This is how a run
   begins: no role owns `idle`, so no agent can start itself.
+- `cordboard task start` is the normal queued-work path: it installs the bottom pending TODO task,
+  resets its lifecycle fields, and moves to the workflow entry phase in one state update.
 - `cordboard set --enabled false` halts every tick immediately, and makes live `cordboard wait` calls
   exit 10. The baton stays exactly where it is, so resuming costs nothing.
 - `cordboard set --role author=<agent>` reassigns a role. Point both roles at one agent to go solo.
@@ -549,11 +559,11 @@ The board is inert until `enabled` is true, and nothing happens with an empty st
 # 1. queue work — bottom of the file is picked first
 $EDITOR cordboard/TODO.md
 
-# 2. arm both agents (above), then hand the baton to the workflow's first phase
-cordboard set --start
-
-# 3. go live
+# 2. arm both agents (above), then go live
 cordboard set --enabled true
+
+# 3. install the bottom task and hand the baton to the workflow's first phase
+cordboard task start
 cordboard status              # confirms whose turn it is
 ```
 
