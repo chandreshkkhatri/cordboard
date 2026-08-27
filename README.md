@@ -16,6 +16,7 @@ cordboard task start
 cordboard brief ag      # Read-only, token-efficient handoff briefing
 cordboard take ag       # Atomically claim the lease and enter active phase
 cordboard advance ag --rev 7  # Atomically finish the work beat and hand off
+cordboard recap         # Reconstruct retained machine-authored task history
 ```
 
 ---
@@ -24,7 +25,7 @@ cordboard advance ag --rev 7  # Atomically finish the work beat and hand off
 
 - 📁 **100% File-Based & Local**: State lives in `cordboard/status.json`, tasks in `cordboard/TODO.md`, backchannel in `cordboard/chat.md`, and plans in `cordboard/plans/`. Everything is inspectable with `cat` and reviewable in `git diff`.
 - 🔒 **Rock-Solid Concurrency & Crash Recovery**: State updates use advisory `flock`, compare-and-swap (CAS) revision counters, and atomic `os.replace` tempfiles. Leases expire automatically, allowing recovery from crashed agents without human intervention.
-- ⚡ **Token-Efficient Agent Turns**: Agents don't need to re-read a 600-line specification or narrate every step. `brief`, `take`, and revision-bound `advance` provide bounded context and atomic handoffs; a summary can be written later.
+- ⚡ **Token-Efficient Agent Turns**: Agents don't need to re-read a 600-line specification or narrate every step. `brief`, `take`, and revision-bound `advance` provide bounded context and atomic handoffs; `recap` reconstructs factual work history so a summary can be written later.
 - 🔄 **Proven Multi-Agent Review Workflows**: Built-in `redline` (author plans & implements with reviewer commentary and round caps) and `relay` (reviewer plans, author builds, reviewer audits).
 - 💬 **Backchannel Messaging**: Append-only agent chat (`cordboard say`) with per-agent cursor tracking and automatic log rotation.
 - ⏱️ **Zero-Token Waiting (`watch`) with Watchdog (`tick`)**: `cordboard wait <agent>` blocks on file updates without consuming LLM turn tokens. Low-frequency `tick` timers serve as fallback watchdogs if a process drops.
@@ -102,7 +103,10 @@ cordboard take ag
 # 4. Execute the revision-bound transition printed by take
 cordboard advance ag --rev 4
 
-# 5. Consume read chat messages
+# 5. At done, execute the revision-bound queue transition printed by brief
+cordboard finish ag --rev 5
+
+# 6. Consume read chat messages
 cordboard say --read ag
 ```
 
@@ -173,6 +177,16 @@ The brief inspects board state and returns one of six deterministic dispositions
 | `resume` | Agent owns an in-progress phase (`drafting`, `implementing`, etc.) | Call `cordboard take <agent>` to resume |
 | `wait` | Another agent owns the current phase | Wait for turn (via `cordboard wait <agent>`) |
 
+### Degraded ancillary context
+
+`brief` and `take` validate board state and the agent before reading advisory files. Missing or
+malformed `TODO.md` and unreadable chat do not strand active work: the brief exposes stable
+`board.warnings` objects (`source`, `code`, `message`), while `chat.available` distinguishes an
+unavailable log from healthy empty context, including a missing chat file. They never repair,
+create, or consume those files. A valid TODO stack becomes mandatory again at `done`; without it the brief is
+`human_required` and provides no completion transition. Required plan and redline evidence remains
+a hard gate throughout.
+
 ### Atomic Work Acquisition: `cordboard take`
 
 When an agent receives `act` or `resume`, `cordboard take <agent>`:
@@ -200,6 +214,33 @@ At `done`, an auto-committing agent derives a conservative candidate file set fr
 and review artifacts, then reconciles it with the current git diff/status. It commits only changes
 with unambiguous task ownership. Ambiguity disables auto-commit for that task: the agent leaves the
 task incomplete and uses the supplied blocked transition to request a human scope decision.
+
+### Retry-Safe Task Completion: `cordboard finish`
+
+At `done`, the brief prints `finish <agent> --rev <revision>`. Finish validates the enabled board,
+current owner, exact revision, done task, and TODO membership under the status-then-TODO lock order.
+It always checks off that task and installs the next LIFO item at its workflow entry phase, or parks
+at `idle`; there is no `--next` choice and no automatic lease. If a crash lands the TODO check-off
+before the state commit, the same command and revision recover from the already-checked item.
+
+Finish does not invoke git, consume chat, write a summary, or infer a successor outside TODO.
+`cordboard task complete [--next]` remains available as a manual human override.
+
+### Bounded Factual History: `cordboard recap`
+
+Each successful `take`, `advance`, and `finish` records one machine-authored lifecycle event in the
+same atomic state write. `cordboard recap [TASK_ID] [--json]` turns the retained events into a
+deterministic lifecycle, handoff, review, completion, and artifact-reference view. This lets agents
+stay focused on work and produce a human summary later.
+
+The ring is capped at 128 events and reports its honest earliest retained revision and truncation
+state. Events contain only fixed facts—revision/time, task identity, actor/action, phase/mode,
+review result, lease disposition, and referenced artifact paths. They never copy chat, notes,
+artifact contents, diffs, prose, or agent-supplied event text. `recap` is strictly read-only and
+creates no lock or cursor write.
+
+The `reviews` view includes only actual decisions: redline gate advances and relay review outcomes.
+Verdicts carried into later response, take, completion, or finish events are not counted again.
 
 ---
 
@@ -247,12 +288,14 @@ Configure your agent runner, cron job, or loop wrapper with this prompt:
 | `cordboard brief <agent> [--json]` | Read-only compact briefing (board, task, turn, action, chat). |
 | `cordboard take <agent> [--json]` | Atomically acquire actionable work, claim lease, and output post-take brief. |
 | `cordboard advance <agent> --rev REV [options]` | Atomically finish one leased work beat without retry-skipping a phase. |
+| `cordboard finish <agent> --rev REV [--json]` | Check off done work and hand off the next LIFO task, retry-safely. |
+| `cordboard recap [TASK_ID] [--json]` | Read the retained factual lifecycle for a task without writing. |
 | `cordboard set [options]` | Update state/baton (e.g., `--phase`, `--claim`, `--release`, `--verdict`, `--force`). |
 | `cordboard wait <agent> [--timeout N]` | Block until it is `<agent>`'s turn. Exit codes: `0` (turn), `10` (disabled), `11` (timeout). |
 | `cordboard say [options]` | Back-channel chat. `say "msg"` appends; `say --read <agent>` reads & advances cursor. |
 | `cordboard task list [--json]` | List tasks from `TODO.md` with pending/done status and LIFO head indicator. |
 | `cordboard task start [--task ID]` | Install the bottom-most pending task and hand off its entry phase. |
-| `cordboard task complete [--next]` | Check off the current task in `TODO.md` and start next item (or park at `idle`). |
+| `cordboard task complete [--next]` | Human override for manual check-off/start-next or park behavior. |
 | `cordboard doctor` | Validate `status.json` schema, agent wake configurations, and `TODO.md` integrity. |
 | `cordboard spec` | Print the full protocol specification (`instructions.md`). |
 

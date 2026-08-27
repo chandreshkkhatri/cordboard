@@ -21,6 +21,18 @@ from cordboard.workflows import (
 SECTIONS = {"board", "task", "turn", "action", "chat"}
 
 
+def add_evidence(root: str, data: dict, task_id: str, *, redline: bool = False) -> None:
+    task_dir = Path(root) / "plans" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / "plan.md").write_text("# Plan\n\nVerify this task.\n")
+    data["task"].update(
+        {"dir": f"plans/{task_id}", "plan_file": f"plans/{task_id}/plan.md"}
+    )
+    if redline:
+        (task_dir / "redline.md").write_text("# Redline\n\nReviewed.\n")
+        data["task"]["last_redline"] = f"plans/{task_id}/redline.md"
+
+
 def brief_json(root: str, agent: str, capsys) -> dict:
     assert main(["--dir", root, "brief", agent, "--json"]) == 0
     captured = capsys.readouterr()
@@ -43,6 +55,7 @@ def test_every_phase_produces_a_stable_brief(request, fixture_name, capsys):
     root = request.getfixturevalue(fixture_name)
     data = state.load(root)
     workflow = data["workflow"]
+    add_evidence(root, data, "all-phases", redline=True)
     for phase, role in PHASES[workflow].items():
         data["task"].update({"id": "all-phases", "phase": phase})
         if phase in {"plan_redlined", "impl_redlined"}:
@@ -115,10 +128,13 @@ def test_json_has_stable_board_task_turn_action_chat_sections(board, capsys):
         "rev",
         "auto_commit",
         "max_rounds",
+        "warnings",
     }
     assert set(output["turn"]) == {"agent", "owner", "disposition", "actionable", "reason"}
     assert set(output["action"]) == {"instructions", "transitions"}
-    assert set(output["chat"]) == {"unread", "cursor", "available_through"}
+    assert set(output["chat"]) == {"available", "unread", "cursor", "available_through"}
+    assert output["board"]["warnings"] == []
+    assert output["chat"]["available"] is True
     assert {
         "id",
         "title",
@@ -179,21 +195,145 @@ def test_invalid_chat_cursor_is_exit_2_without_stdout(board, capsys, cursor):
     assert "chat_cursor must be a non-negative integer" in captured.err
 
 
-@pytest.mark.parametrize("damage", ("board", "todo", "chat"))
-def test_invalid_inputs_never_produce_a_partial_brief(board, capsys, damage):
-    root = Path(board)
-    if damage == "board":
-        data = state.load(board)
-        data["task"]["phase"] = "invented"
-        state.write_atomic(board, data)
-    elif damage == "todo":
-        (root / "TODO.md").write_text("- [ ] malformed\n")
-    else:
-        Path(state.chat_path(board)).write_bytes(b"\xff")
+def test_invalid_board_never_produces_a_partial_brief(board, capsys):
+    data = state.load(board)
+    data["task"]["phase"] = "invented"
+    state.write_atomic(board, data)
     assert main(["--dir", board, "brief", "ag", "--json"]) == EXIT_BAD_STATE
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err.startswith("cordboard:")
+
+
+@pytest.mark.parametrize("damage", ("missing", "invalid"))
+def test_active_brief_degrades_when_todo_is_unavailable(board, capsys, damage):
+    root = Path(board)
+    data = state.load(board)
+    data["task"].update({"id": "keep-working", "phase": "awaiting_draft"})
+    state.write_atomic(board, data)
+    if damage == "missing":
+        (root / "TODO.md").unlink()
+    else:
+        (root / "TODO.md").write_text("- [ ] malformed\n")
+    output = brief_json(board, "ag", capsys)
+    assert output["turn"]["disposition"] == "act"
+    assert output["action"]["transitions"]
+    assert output["board"]["warnings"] == [
+        {
+            "source": "todo",
+            "code": damage,
+            "message": output["board"]["warnings"][0]["message"],
+        }
+    ]
+
+
+def test_missing_chat_is_healthy_available_empty_context_in_json(board, capsys):
+    missing = brief_json(board, "ag", capsys)
+    assert missing["chat"] == {
+        "available": True,
+        "unread": "",
+        "cursor": 0,
+        "available_through": 0,
+    }
+    assert missing["board"]["warnings"] == []
+
+
+def test_missing_chat_renders_as_normal_empty_context_for_humans(board, capsys):
+    assert not Path(state.chat_path(board)).exists()
+    assert main(["--dir", board, "brief", "ag"]) == 0
+    output = capsys.readouterr().out
+    assert "chat:\n  (none)\n" in output
+    assert "(unavailable)" not in output
+
+
+def test_available_empty_chat_has_the_same_healthy_contract(board, capsys):
+    Path(state.chat_path(board)).write_text("")
+    available = brief_json(board, "ag", capsys)
+    assert available["chat"]["available"] is True
+    assert available["chat"]["unread"] == ""
+    assert available["chat"]["available_through"] == 0
+
+
+def test_malformed_chat_is_a_stable_unavailable_warning(board, capsys):
+    data = state.load(board)
+    data["task"].update({"id": "keep-working", "phase": "awaiting_draft"})
+    state.write_atomic(board, data)
+    Path(state.chat_path(board)).write_bytes(b"\xff")
+    output = brief_json(board, "ag", capsys)
+    assert output["turn"]["disposition"] == "act"
+    assert output["chat"]["available"] is False
+    assert output["chat"]["unread"] == ""
+    assert output["board"]["warnings"][0]["source"] == "chat"
+    assert output["board"]["warnings"][0]["code"] == "invalid_utf8"
+    assert set(output["board"]["warnings"][0]) == {"source", "code", "message"}
+
+
+def test_simultaneous_todo_and_chat_failures_have_deterministic_exact_warnings(
+    board, capsys
+):
+    root = Path(board)
+    data = state.load(board)
+    data["task"].update({"id": "two-warnings", "phase": "awaiting_draft"})
+    state.write_atomic(board, data)
+    (root / "TODO.md").write_text("- [ ] malformed\n")
+    Path(state.chat_path(board)).write_bytes(b"\xff")
+    output = brief_json(board, "ag", capsys)
+    assert output["board"]["warnings"] == [
+        {
+            "source": "todo",
+            "code": "invalid",
+            "message": (
+                f"invalid task at {root / 'TODO.md'}:1; "
+                "expected `- [ ] <id> — <title>`"
+            ),
+        },
+        {
+            "source": "chat",
+            "code": "invalid_utf8",
+            "message": f"{state.chat_path(board)} is not valid UTF-8",
+        },
+    ]
+    assert output["chat"] == {
+        "available": False,
+        "unread": "",
+        "cursor": 0,
+        "available_through": None,
+    }
+
+
+def test_unknown_agent_is_checked_before_broken_ancillary_files(board, capsys):
+    Path(board, "TODO.md").write_text("- [ ] malformed\n")
+    Path(state.chat_path(board)).write_bytes(b"\xff")
+    assert main(["--dir", board, "brief", "stranger", "--json"]) == EXIT_REFUSED
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "unknown agent" in captured.err
+
+
+def test_done_with_invalid_todo_requires_human_and_omits_completion(board, capsys):
+    data = state.load(board)
+    data["task"].update({"id": "done-invalid-queue", "phase": "done"})
+    add_evidence(board, data, "done-invalid-queue")
+    state.write_atomic(board, data)
+    Path(board, "TODO.md").write_text("- [ ] malformed\n")
+    output = brief_json(board, "ag", capsys)
+    assert output["turn"]["disposition"] == "human_required"
+    assert output["action"]["transitions"] == []
+    assert "valid TODO stack" in output["turn"]["reason"]
+
+
+@pytest.mark.parametrize("phase", ("plan_submitted", "plan_redlined"))
+def test_missing_required_artifacts_are_a_hard_brief_gate(board, capsys, phase):
+    data = state.load(board)
+    data["task"].update(
+        {"id": "missing-evidence", "phase": phase, "verdict": "revise"}
+    )
+    state.write_atomic(board, data)
+    agent = "cc" if phase == "plan_submitted" else "ag"
+    output = brief_json(board, agent, capsys)
+    assert output["turn"]["disposition"] == "human_required"
+    assert output["action"]["transitions"] == []
+    assert "task.dir does not exist" in output["turn"]["reason"]
 
 
 def test_plan_context_is_executable_without_the_spec(board, capsys):
@@ -217,6 +357,7 @@ def test_redline_gate_includes_round_verdict_and_path(board, capsys, phase, gate
     data["task"].update(
         {"id": "redline", "phase": phase, "dir": "plans/redline", "round": {"plan": 1, "impl": 0}}
     )
+    add_evidence(board, data, "redline")
     state.write_atomic(board, data)
     output = brief_json(board, "cc", capsys)
     expected = data["task"]["round"][gate] + 1
@@ -244,6 +385,7 @@ def test_relay_plan_only_finishes_without_author_handoff(relay_board, capsys):
 def test_relay_review_includes_clean_and_issue_branches(relay_board, capsys):
     data = state.load(relay_board)
     data["task"].update({"id": "review", "phase": "awaiting_review"})
+    add_evidence(relay_board, data, "review")
     state.write_atomic(relay_board, data)
     output = brief_json(relay_board, "cc", capsys)
     targets = {
@@ -264,11 +406,15 @@ def test_done_makes_auto_commit_policy_explicit(board, capsys, auto_commit):
     data = state.load(board)
     data["auto_commit"] = auto_commit
     data["task"].update({"id": "done", "phase": "done"})
+    add_evidence(board, data, "done")
     state.write_atomic(board, data)
     output = brief_json(board, "ag", capsys)
     expected = "enabled" if auto_commit else "disabled"
     assert expected in output["action"]["instructions"][0]
-    assert output["action"]["transitions"][0].endswith("task complete --next")
+    assert output["action"]["transitions"][0].endswith(
+        f"finish ag --rev {output['board']['rev']}"
+    )
+    assert not any("task complete" in item for item in output["action"]["transitions"])
     if auto_commit:
         guidance = " ".join(output["action"]["instructions"])
         assert "task plan and review artifacts" in guidance
@@ -294,6 +440,7 @@ def test_solo_mapping_can_act_for_reviewer_phase(board, capsys):
     data = state.load(board)
     data["roles"] = {"reviewer": "ag", "author": "ag"}
     data["task"].update({"id": "solo", "phase": "plan_submitted"})
+    add_evidence(board, data, "solo")
     state.write_atomic(board, data)
     output = brief_json(board, "ag", capsys)
     assert output["turn"]["owner"] == "ag"
@@ -305,6 +452,7 @@ def test_every_emitted_phase_transition_is_reachable(request, capsys):
         root = request.getfixturevalue(fixture_name)
         data = state.load(root)
         workflow = data["workflow"]
+        add_evidence(root, data, "legal", redline=True)
         for phase, role in PHASES[workflow].items():
             data["task"].update(
                 {

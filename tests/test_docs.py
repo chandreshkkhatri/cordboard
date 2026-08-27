@@ -18,6 +18,7 @@ from cordboard.workflows import (
     ADVANCE_REFUSALS,
     BRIEF_DISPOSITIONS,
     BRIEF_GUIDANCE,
+    FINISH_REFUSALS,
     PHASES,
     TAKE_MODES,
     TAKE_PHASES,
@@ -128,6 +129,42 @@ def test_commit_scope_does_not_depend_on_incremental_agent_notes():
     assert "task plan and review artifacts" in text
     assert "Ambiguity means no auto-commit" in text
     assert "human_required" in text
+
+
+def test_degraded_ancillary_context_contract_is_documented():
+    text = spec_text()
+    assert "board.warnings" in text
+    assert "`source`, `code`, and `message`" in text
+    assert "missing chat file is healthy empty context" in text
+    assert "`chat.available=false`" in text
+    assert "does not prevent an otherwise safe active acquisition" in text
+    assert "At `done`, a missing or\ninvalid TODO stack" in text
+    assert "neither infers\na fallback task from TODO" in text
+
+
+def test_finish_contract_is_documented():
+    text = spec_text()
+    assert "cordboard finish <agent> --rev" in text
+    assert "status-then-TODO order" in text
+    assert "reports `recovered=true`" in text
+    assert "has no `--next` option" in text
+    assert "remains the human override" in text
+    for reason in FINISH_REFUSALS:
+        assert f"`{reason}`" in text
+
+
+def test_bounded_factual_recap_contract_is_documented():
+    text = spec_text()
+    assert "cordboard recap [TASK_ID] [--json]" in text
+    assert "same atomic `status.json` write" in text
+    assert "at most 128 events" in text
+    assert "`earliest_available_rev`" in text
+    assert "`available=false`" in text
+    assert "creates no lock" in text
+    assert "Event text is never\naccepted from an agent" in text
+    assert "Chat, notes, artifact content, summaries, prose, and git diff content" in text
+    assert "`reviews` view contains decision events only" in text
+    assert "do not create duplicate reviews" in text
 
 
 def test_no_references_to_the_repo_it_came_from():

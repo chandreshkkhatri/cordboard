@@ -184,6 +184,16 @@ ADVANCE_REFUSALS = (
     "artifact_invalid",
 )
 
+FINISH_REFUSALS = (
+    "unknown_agent",
+    "disabled",
+    "revision_mismatch",
+    "not_done",
+    "not_owner",
+    "missing_task",
+    "task_not_in_todo",
+)
+
 
 def _brief(*instructions: str, fields: tuple[str, ...] = ()) -> dict[str, tuple[str, ...]]:
     return {"instructions": instructions, "task_fields": fields}

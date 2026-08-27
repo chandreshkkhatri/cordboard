@@ -146,6 +146,12 @@ def test_advance_covers_every_phase_and_branch(
     assert result["phase"] == target == state.phase(after)
     assert result["rev"] == rev + 1 == after["rev"]
     assert result["facts"]["plan_file"] == "plans/advance/plan.md"
+    event = state.load(root)["history"]["events"][-1]
+    assert event["rev"] == result["rev"]
+    assert event["action"] == "advance"
+    assert event["from_phase"] == phase
+    assert event["phase"] == target
+    assert event["mode"] == mode
     if mode == "continued":
         assert result["released"] is False
         assert result["lease_holder"] == agent

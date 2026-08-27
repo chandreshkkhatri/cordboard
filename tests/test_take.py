@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 import cordboard.cli as cli
-from cordboard import state
+from cordboard import chat, state
 from cordboard.cli import EXIT_BAD_STATE, EXIT_REFUSED, main
 from cordboard.workflows import (
     IN_PROGRESS,
@@ -34,6 +34,18 @@ ENVELOPE_KEYS = {
     "lease_expires_at",
     "brief",
 }
+
+
+def add_evidence(root: str, data: dict, task_id: str, *, redline: bool = False) -> None:
+    task_dir = Path(root) / "plans" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / "plan.md").write_text("# Plan\n\nVerify this task.\n")
+    data["task"].update(
+        {"dir": f"plans/{task_id}", "plan_file": f"plans/{task_id}/plan.md"}
+    )
+    if redline:
+        (task_dir / "redline.md").write_text("# Redline\n\nReviewed.\n")
+        data["task"]["last_redline"] = f"plans/{task_id}/redline.md"
 
 
 def take_json(root: str, agent: str, capsys, expected: int = 0) -> dict:
@@ -72,6 +84,7 @@ def test_take_acquires_every_stable_work_handoff(
             "verdict": "revise",
         }
     )
+    add_evidence(root, data, "take-work", redline=True)
     state.write_atomic(root, data)
     before_rev = data["rev"]
     result = take_json(root, agent, capsys)
@@ -90,6 +103,12 @@ def test_take_acquires_every_stable_work_handoff(
     assert result["brief"]["board"]["rev"] == after["rev"]
     assert result["brief"]["task"]["phase"] == target
     assert result["brief"]["action"]["instructions"]
+    event = after["history"]["events"][-1]
+    assert event["rev"] == result["rev"]
+    assert event["action"] == "take"
+    assert event["from_phase"] == phase
+    assert event["phase"] == target
+    assert event["mode"] == mode
     assert all(
         "Claim the lease" not in item
         for item in result["brief"]["action"]["instructions"]
@@ -121,6 +140,8 @@ def test_take_resumes_every_in_progress_phase(request, fixture_name, phase, agen
     root = request.getfixturevalue(fixture_name)
     data = state.load(root)
     data["task"].update({"id": "resume", "phase": phase})
+    if phase not in {"planning", "drafting"}:
+        add_evidence(root, data, "resume")
     state.write_atomic(root, data)
     result = take_json(root, agent, capsys)
     assert result["mode"] == "resumed"
@@ -251,6 +272,7 @@ def test_human_take_renders_full_nonredundant_post_take_brief(relay_board, capsy
     data["task"].update(
         {"id": "human", "title": "Useful output", "phase": "plan_ready"}
     )
+    add_evidence(relay_board, data, "human")
     state.write_atomic(relay_board, data)
     Path(state.chat_path(relay_board)).write_text("Remember the focused test\n")
     assert main(["--dir", relay_board, "take", "ag"]) == 0
@@ -264,16 +286,90 @@ def test_human_take_renders_full_nonredundant_post_take_brief(relay_board, capsy
     assert "--claim" not in output
 
 
-def test_malformed_chat_fails_before_take_commits(board, capsys):
+def test_malformed_chat_degrades_without_blocking_take(board, capsys):
     data = state.load(board)
     data["task"].update({"id": "bad-chat", "phase": "awaiting_draft"})
     state.write_atomic(board, data)
-    before = state.load(board)
     Path(state.chat_path(board)).write_bytes(b"\xff")
-    assert main(["--dir", board, "take", "ag", "--json"]) == EXIT_BAD_STATE
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "not valid UTF-8" in captured.err
+    result = take_json(board, "ag", capsys)
+    assert result["claimed"] is True
+    assert result["brief"]["chat"]["available"] is False
+    assert result["brief"]["board"]["warnings"][0]["source"] == "chat"
+    assert result["brief"]["board"]["warnings"][0]["code"] == "invalid_utf8"
+
+
+@pytest.mark.parametrize("damage", ("missing", "invalid"))
+def test_unavailable_todo_does_not_block_active_take(board, capsys, damage):
+    root = Path(board)
+    data = state.load(board)
+    data["task"].update({"id": "degraded-todo", "phase": "awaiting_draft"})
+    state.write_atomic(board, data)
+    if damage == "missing":
+        (root / "TODO.md").unlink()
+    else:
+        (root / "TODO.md").write_text("- [ ] malformed\n")
+    before_rev = state.load(board)["rev"]
+    result = take_json(board, "ag", capsys)
+    assert result["rev"] == before_rev + 1
+    assert result["brief"]["board"]["warnings"][0]["source"] == "todo"
+    assert result["brief"]["board"]["warnings"][0]["code"] == damage
+
+
+def test_unreadable_chat_snapshot_is_warned_and_never_reread(
+    board, capsys, monkeypatch
+):
+    data = state.load(board)
+    data["task"].update({"id": "unreadable-chat", "phase": "awaiting_draft"})
+    state.write_atomic(board, data)
+    Path(state.chat_path(board)).write_text("exists")
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(chat, "unread", fail_once)
+    result = take_json(board, "ag", capsys)
+    assert calls == 1
+    assert result["brief"]["chat"]["available"] is False
+    assert result["brief"]["board"]["warnings"][0]["code"] == "unreadable"
+
+
+def test_unknown_agent_precedes_broken_ancillary_context(board, capsys):
+    Path(board, "TODO.md").write_text("- [ ] malformed\n")
+    Path(state.chat_path(board)).write_bytes(b"\xff")
+    result = take_json(board, "stranger", capsys, expected=EXIT_REFUSED)
+    assert result["reason"] == "unknown_agent"
+    assert result["brief"] is None
+
+
+def test_done_with_invalid_todo_refuses_as_human_required(board, capsys):
+    data = state.load(board)
+    data["task"].update({"id": "done-bad-todo", "phase": "done"})
+    add_evidence(board, data, "done-bad-todo")
+    state.write_atomic(board, data)
+    Path(board, "TODO.md").write_text("- [ ] malformed\n")
+    before = state.load(board)
+    result = take_json(board, "ag", capsys, expected=EXIT_REFUSED)
+    assert result["reason"] == "human_required"
+    assert "valid TODO stack" in result["message"]
+    assert state.load(board) == before
+
+
+@pytest.mark.parametrize("phase,agent", (("plan_submitted", "cc"), ("plan_redlined", "ag")))
+def test_missing_required_artifact_refuses_take_without_commit(
+    board, capsys, phase, agent
+):
+    data = state.load(board)
+    data["task"].update(
+        {"id": "missing-evidence", "phase": phase, "verdict": "revise"}
+    )
+    state.write_atomic(board, data)
+    before = state.load(board)
+    result = take_json(board, agent, capsys, expected=EXIT_REFUSED)
+    assert result["reason"] == "human_required"
+    assert "task.dir does not exist" in result["message"]
     assert state.load(board) == before
 
 
@@ -372,6 +468,7 @@ def test_solo_role_mapping_can_take_reviewer_work(board, capsys):
     data = state.load(board)
     data["roles"] = {"reviewer": "ag", "author": "ag"}
     data["task"].update({"id": "solo", "phase": "plan_submitted"})
+    add_evidence(board, data, "solo")
     state.write_atomic(board, data)
     result = take_json(board, "ag", capsys)
     assert result["phase"] == "plan_redlining"

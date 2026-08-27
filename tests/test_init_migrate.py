@@ -100,6 +100,11 @@ def test_migrate_v2_keeps_the_task_in_flight(tmp_path):
     # a timer because it could not watch, and claiming otherwise is a guess.
     assert data["agents"]["antigravity"]["watch"] is False
     assert data["agents"]["antigravity"]["tick"]
+    assert data["history"] == {
+        "events": [],
+        "truncated": True,
+        "earliest_rev": None,
+    }
     assert "migrated v2" in report
 
 
@@ -121,3 +126,26 @@ def test_migrate_is_idempotent(tmp_path):
     root = str(tmp_path / "cordboard")
     init_board(root)
     assert "nothing to migrate" in migrate_v2(root, root)
+
+
+def test_migrate_v4_adds_honest_empty_history_and_backup(tmp_path):
+    root = str(tmp_path / "cordboard")
+    init_board(root)
+    old = state.load(root)
+    old["version"] = 4
+    old["rev"] = 7
+    old.pop("history")
+    state.write_atomic(root, old)
+
+    report = migrate_v2(root, root)
+    migrated = state.load(root)
+
+    assert report == "migrated v4 -> v5: factual history starts empty"
+    assert migrated["version"] == state.SCHEMA_VERSION
+    assert migrated["history"] == {
+        "events": [],
+        "truncated": True,
+        "earliest_rev": None,
+    }
+    assert os.path.exists(state.status_path(root) + ".v4.bak")
+    state.validate(migrated)

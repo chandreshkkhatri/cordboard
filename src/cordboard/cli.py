@@ -23,6 +23,7 @@ from .workflows import (
     ADVANCE_REFUSALS,
     BRIEF_DISPOSITIONS,
     BRIEF_GUIDANCE,
+    FINISH_REFUSALS,
     IN_PROGRESS,
     PHASES,
     ROLES,
@@ -172,6 +173,14 @@ def _safe_task_id(value: Any) -> str:
     return cleaned.strip(".") or "task"
 
 
+def _artifact_refs(task: dict[str, Any]) -> list[str]:
+    return [
+        value
+        for key in ("plan_file", "last_redline")
+        if isinstance((value := task.get(key)), str) and value
+    ]
+
+
 def _gate(phase: str) -> str | None:
     if phase in {"plan_submitted", "plan_redlining", "plan_redlined"}:
         return "plan"
@@ -185,7 +194,11 @@ def _command(root: str, body: str) -> str:
 
 
 def _brief_disposition(
-    data: dict[str, Any], agent: str, owner: str | None, phase: str
+    data: dict[str, Any],
+    agent: str,
+    owner: str | None,
+    phase: str,
+    hard_reason: str | None = None,
 ) -> tuple[str, str]:
     if not data.get("enabled"):
         return "disabled", "board is disabled"
@@ -193,6 +206,8 @@ def _brief_disposition(
         return "parked", "no task currently holds the baton"
     if phase == "blocked":
         return "human_required", "blocked task needs an operator decision"
+    if hard_reason:
+        return "human_required", hard_reason
     task = state.task(data)
     if phase in {"plan_redlined", "impl_redlined"} and (
         not task.get("last_redline") or not task.get("verdict")
@@ -280,7 +295,7 @@ def _brief_transitions(
             f"set --agent {who} --phase impl_submitted --release --status paused",
         ]
     elif phase == "done":
-        commands = ["task complete --next"]
+        commands = [f"finish {who} --rev {data['rev']}"]
         if data.get("auto_commit"):
             commands.append(
                 f"set --agent {who} --phase blocked --note "
@@ -308,20 +323,102 @@ def _advance_commands(
     return [_command(root, body) for body in bodies]
 
 
+def _warning(source: str, code: str, message: str) -> dict[str, str]:
+    return {"source": source, "code": code, "message": message}
+
+
+def _ancillary_context(
+    root: str, data: dict[str, Any], agent: str
+) -> tuple[bool, str, int | None, bool, list[dict[str, str]]]:
+    """Read advisory queue/chat context without weakening the state contract."""
+    warnings: list[dict[str, str]] = []
+    todo_path = state.stack_path(root)
+    if not os.path.exists(todo_path):
+        todo_available = False
+        warnings.append(_warning("todo", "missing", f"task stack is missing: {todo_path}"))
+    else:
+        try:
+            tasks.read(root)
+            todo_available = True
+        except UnicodeError:
+            todo_available = False
+            warnings.append(
+                _warning("todo", "invalid_utf8", f"task stack is not valid UTF-8: {todo_path}")
+            )
+        except state.StateError as exc:
+            todo_available = False
+            warnings.append(_warning("todo", "invalid", str(exc)))
+        except OSError as exc:
+            todo_available = False
+            warnings.append(_warning("todo", "unreadable", str(exc)))
+
+    chat_path = state.chat_path(root)
+    if not os.path.exists(chat_path):
+        return todo_available, "", 0, True, warnings
+    try:
+        unread, available_through = chat.unread(root, data, agent)
+        return todo_available, unread, available_through, True, warnings
+    except state.StateError as exc:
+        warnings.append(_warning("chat", "invalid_utf8", str(exc)))
+    except UnicodeError as exc:
+        warnings.append(_warning("chat", "invalid_utf8", str(exc)))
+    except OSError as exc:
+        warnings.append(_warning("chat", "unreadable", str(exc)))
+    return todo_available, "", None, False, warnings
+
+
+def _required_artifact_error(root: str, data: dict[str, Any]) -> str | None:
+    """Return why existing phase evidence is unsafe, or None while it is being authored."""
+    phase = state.phase(data)
+    if phase in {
+        "idle",
+        "blocked",
+        "awaiting_draft",
+        "drafting",
+        "awaiting_plan",
+        "planning",
+    }:
+        return None
+    current_task = state.task(data)
+    task_id = current_task.get("id")
+    if not isinstance(task_id, str) or not task_id.strip():
+        return "active work needs a non-empty task id"
+    task_dir_candidate = current_task.get("dir") or f"plans/{_safe_task_id(task_id)}"
+    task_dir, error = _validate_task_dir(root, str(task_dir_candidate))
+    if error:
+        return error
+    assert task_dir is not None
+    plan_candidate = current_task.get("plan_file") or f"{task_dir}/plan.md"
+    _, error = _validate_artifact(root, task_dir, str(plan_candidate))
+    if error:
+        return error
+    if phase in {"plan_redlined", "impl_redlined"}:
+        stored = current_task.get("last_redline")
+        if not stored:
+            return "review handoff is missing its redline path"
+        _, error = _validate_artifact(root, task_dir, str(stored))
+        if error:
+            return error
+    return None
+
+
 def _brief_payload(
     root: str,
     data: dict[str, Any],
     agent: str,
     unread: str,
-    available_through: int,
+    available_through: int | None,
     *,
+    chat_available: bool,
+    warnings: list[dict[str, str]],
+    hard_reason: str | None = None,
     acquisition_mode: str | None = None,
 ) -> dict[str, Any]:
     state.validate(data)
     flow = roles.workflow(data)
     phase = state.phase(data)
     owner = roles.owner(data)
-    disposition, reason = _brief_disposition(data, agent, owner, phase)
+    disposition, reason = _brief_disposition(data, agent, owner, phase, hard_reason)
     assert disposition in BRIEF_DISPOSITIONS
     actionable = disposition in {"act", "resume"}
     raw_task = state.task(data)
@@ -439,6 +536,7 @@ def _brief_payload(
             "rev": data["rev"],
             "auto_commit": data["auto_commit"],
             "max_rounds": data["max_rounds"],
+            "warnings": warnings,
         },
         "task": task_view,
         "turn": {
@@ -450,6 +548,7 @@ def _brief_payload(
         },
         "action": {"instructions": instructions, "transitions": transitions},
         "chat": {
+            "available": chat_available,
             "unread": unread,
             "cursor": block.get("chat_cursor", 0),
             "available_through": available_through,
@@ -468,6 +567,10 @@ def _print_brief(payload: dict[str, Any]) -> None:
         f"phase={task['phase']} owner={turn['owner'] or '—'}"
     )
     print(f"title={task['title'] or '—'} kind={task['kind'] or '—'}")
+    if board["warnings"]:
+        print("warnings:")
+        for warning in board["warnings"]:
+            print(f"  - {warning['source']}.{warning['code']}: {warning['message']}")
     context_fields = (
         "dir",
         "plan_file",
@@ -486,7 +589,10 @@ def _print_brief(payload: dict[str, Any]) -> None:
         for name, note in task["notes"].items():
             print(f"  {name}: {note}")
     print("chat:")
-    print(payload["chat"]["unread"] or "  (none)")
+    if not payload["chat"]["available"]:
+        print("  (unavailable)")
+    else:
+        print(payload["chat"]["unread"] or "  (none)")
     print("instructions:")
     for item in payload["action"]["instructions"]:
         print(f"  - {item}")
@@ -500,12 +606,25 @@ def cmd_brief(args: argparse.Namespace) -> int:
     root = _root(args)
     data = state.load(root)
     state.validate(data)
-    tasks.read(root)
-    unread, available_through = chat.unread(root, data, args.agent)
     if args.agent not in state.agents(data):
         print(f"cordboard: unknown agent {args.agent!r}", file=sys.stderr)
         return EXIT_REFUSED
-    payload = _brief_payload(root, data, args.agent, unread, available_through)
+    todo_available, unread, available_through, chat_available, warnings = (
+        _ancillary_context(root, data, args.agent)
+    )
+    hard_reason = _required_artifact_error(root, data)
+    if state.phase(data) == "done" and not todo_available:
+        hard_reason = "task completion needs a valid TODO stack; ask an operator to repair it"
+    payload = _brief_payload(
+        root,
+        data,
+        args.agent,
+        unread,
+        available_through,
+        chat_available=chat_available,
+        warnings=warnings,
+        hard_reason=hard_reason,
+    )
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
@@ -567,8 +686,25 @@ def cmd_take(args: argparse.Namespace) -> int:
     root = _root(args)
     initial = state.load(root)
     state.validate(initial)
-    tasks.read(root)
-    initial_unread, initial_available = chat.unread(root, initial, args.agent)
+    if args.agent not in state.agents(initial):
+        lock = initial.get("lock") or {}
+        payload = _take_envelope(
+            reason="unknown_agent",
+            message=f"unknown agent {args.agent!r}",
+            taken_from=state.phase(initial),
+            rev=initial["rev"],
+            phase=state.phase(initial),
+            lease_holder=lock.get("holder"),
+            lease_expires_at=lock.get("expires_at"),
+        )
+        return _report_take(args, payload, EXIT_REFUSED)
+    (
+        todo_available,
+        initial_unread,
+        initial_available,
+        chat_available,
+        warnings,
+    ) = _ancillary_context(root, initial, args.agent)
     refusal: dict[str, str | None] = {"reason": None, "message": None, "phase": None}
     outcome: dict[str, Any] = {}
 
@@ -590,6 +726,12 @@ def cmd_take(args: argparse.Namespace) -> int:
         if current == "blocked":
             return refuse("human_required", "blocked task needs an operator decision", current)
         if current == "done":
+            if not todo_available:
+                return refuse(
+                    "human_required",
+                    "task completion needs a valid TODO stack; ask an operator to repair it",
+                    current,
+                )
             return refuse(
                 "bookkeeping",
                 "phase done needs `cordboard task complete --next`, not a work lease",
@@ -601,7 +743,10 @@ def cmd_take(args: argparse.Namespace) -> int:
         current_task = state.task(data)
         if not isinstance(current_task.get("id"), str) or not current_task["id"].strip():
             return refuse("missing_task", "active work needs a non-empty task id", current)
-        disposition, why = _brief_disposition(data, args.agent, owner, current)
+        hard_reason = _required_artifact_error(root, data)
+        disposition, why = _brief_disposition(
+            data, args.agent, owner, current, hard_reason
+        )
         if disposition == "human_required":
             return refuse("human_required", why, current)
 
@@ -645,9 +790,23 @@ def cmd_take(args: argparse.Namespace) -> int:
                     args.agent,
                     initial_unread,
                     initial_available,
+                    chat_available=chat_available,
+                    warnings=warnings,
                     acquisition_mode=mode,
                 ),
             }
+        )
+        state.record_history_event(
+            data,
+            task_id=current_task["id"],
+            task_title=current_task.get("title"),
+            actor=args.agent,
+            action="take",
+            from_phase=current,
+            phase=target,
+            mode=mode,
+            lease="claimed",
+            artifacts=_artifact_refs(current_task),
         )
         return None
 
@@ -962,6 +1121,21 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 "facts": facts,
             }
         )
+        state.record_history_event(
+            data,
+            task_id=task["id"],
+            task_title=task.get("title"),
+            actor=args.agent,
+            action="advance",
+            from_phase=current,
+            phase=target,
+            mode=mode,
+            verdict=verdict,
+            round_number=round_number,
+            outcome=args.outcome,
+            lease="released" if released else "retained",
+            artifacts=[plan_file, redline_file] if redline_file else [plan_file],
+        )
         return None
 
     data, written = state.update(root, advance, actor=args.agent)
@@ -1001,6 +1175,277 @@ def cmd_advance(args: argparse.Namespace) -> int:
         facts=outcome["facts"],
     )
     return _report_advance(args, payload, 0)
+
+
+# --------------------------------------------------------------------------- finish
+
+
+def _finish_envelope(
+    *,
+    finished: bool = False,
+    reason: str,
+    message: str,
+    expected_rev: int,
+    rev: int,
+    agent: str,
+    completed_task: dict[str, Any] | None,
+    todo_changed: bool = False,
+    recovered: bool = False,
+    next_task: dict[str, Any] | None = None,
+    next_phase: str | None = None,
+    next_owner: str | None = None,
+    parked: bool = False,
+) -> dict[str, Any]:
+    return {
+        "finished": finished,
+        "reason": reason,
+        "message": message,
+        "expected_rev": expected_rev,
+        "rev": rev,
+        "agent": agent,
+        "completed_task": completed_task,
+        "todo_changed": todo_changed,
+        "recovered": recovered,
+        "next_task": next_task,
+        "next_phase": next_phase,
+        "next_owner": next_owner,
+        "parked": parked,
+    }
+
+
+def _report_finish(args: argparse.Namespace, payload: dict[str, Any], code: int) -> int:
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    elif code == 0:
+        completed = payload["completed_task"]
+        suffix = " (recovered TODO write)" if payload["recovered"] else ""
+        print(
+            f"cordboard: finished {completed['id']} rev={payload['rev']}{suffix}"
+        )
+        if payload["parked"]:
+            print("next=idle owner=—")
+        else:
+            next_task = payload["next_task"]
+            print(
+                f"next={next_task['id']} phase={payload['next_phase']} "
+                f"owner={payload['next_owner']}"
+            )
+    else:
+        print(f"cordboard: {payload['message']}", file=sys.stderr)
+    return code
+
+
+def cmd_finish(args: argparse.Namespace) -> int:
+    """Revision-bound completion and automatic LIFO queue handoff."""
+    root = _root(args)
+    refusal: dict[str, str | None] = {"reason": None, "message": None}
+    outcome: dict[str, Any] = {}
+
+    def refuse(reason: str, message: str) -> bool:
+        assert reason in FINISH_REFUSALS
+        refusal.update({"reason": reason, "message": message})
+        return False
+
+    def finish(data: dict[str, Any]) -> Any:
+        state.validate(data)
+        if not data.get("enabled"):
+            return refuse("disabled", "board is disabled")
+        if args.agent not in state.agents(data):
+            return refuse("unknown_agent", f"unknown agent {args.agent!r}")
+        if data["rev"] != args.rev:
+            return refuse(
+                "revision_mismatch",
+                f"expected rev {args.rev}, found {data['rev']}; read a fresh brief",
+            )
+        if state.phase(data) != "done":
+            return refuse("not_done", f"phase {state.phase(data)} is not done")
+        owner = roles.owner(data)
+        if owner != args.agent:
+            return refuse("not_owner", f"waiting for {owner}")
+        current = state.task(data)
+        task_id = current.get("id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            return refuse("missing_task", "done work needs a non-empty task id")
+        completed_artifacts = _artifact_refs(current)
+        completed_verdict = current.get("verdict")
+        completed_rounds = current.get("round") or {}
+        completed_round = completed_rounds.get("impl") or completed_rounds.get("plan") or None
+
+        try:
+            changed, completed, next_item = tasks.finish_current_locked(root, task_id)
+        except tasks.TaskNotFound as exc:
+            return refuse("task_not_in_todo", str(exc))
+
+        if next_item is None:
+            current["phase"] = "idle"
+            next_task = None
+            parked = True
+        else:
+            data["task"] = {
+                "id": next_item.id,
+                "title": next_item.title,
+                "kind": "implement",
+                "phase": roles.entry_phase(data),
+                "dir": None,
+                "plan_file": None,
+                "last_redline": None,
+                "verdict": None,
+                "handoff_at": None,
+                "round": {"plan": 0, "impl": 0},
+            }
+            next_task = {"id": next_item.id, "title": next_item.title}
+            parked = False
+        state.release_lease(data, force=True)
+        state.touch(data, args.agent, status="paused")
+        outcome.update(
+            {
+                "completed_task": {"id": completed.id, "title": completed.title},
+                "todo_changed": changed,
+                "recovered": not changed,
+                "next_task": next_task,
+                "next_phase": state.phase(data),
+                "next_owner": roles.owner(data),
+                "parked": parked,
+            }
+        )
+        state.record_history_event(
+            data,
+            task_id=completed.id,
+            task_title=completed.title,
+            actor=args.agent,
+            action="finish",
+            from_phase="done",
+            phase=state.phase(data),
+            mode="parked" if parked else "next",
+            verdict=completed_verdict,
+            round_number=completed_round,
+            lease="released",
+            artifacts=completed_artifacts,
+        )
+        return None
+
+    data, written = state.update(
+        root, finish, actor=args.agent, secondary_lock=lambda: tasks.locked(root)
+    )
+    current = state.task(data)
+    if not written:
+        current_phase = state.phase(data)
+        payload = _finish_envelope(
+            reason=str(refusal["reason"] or "not_done"),
+            message=str(refusal["message"] or "task could not be finished"),
+            expected_rev=args.rev,
+            rev=data["rev"],
+            agent=args.agent,
+            completed_task=(
+                {"id": current.get("id"), "title": current.get("title")}
+                if current_phase == "done" and current.get("id")
+                else None
+            ),
+            next_phase=current_phase,
+            next_owner=roles.owner(data),
+            parked=current_phase == "idle",
+        )
+        return _report_finish(args, payload, EXIT_REFUSED)
+
+    payload = _finish_envelope(
+        finished=True,
+        reason="finished",
+        message=f"finished task {outcome['completed_task']['id']}",
+        expected_rev=args.rev,
+        rev=data["rev"],
+        agent=args.agent,
+        completed_task=outcome["completed_task"],
+        todo_changed=bool(outcome["todo_changed"]),
+        recovered=bool(outcome["recovered"]),
+        next_task=outcome["next_task"],
+        next_phase=outcome["next_phase"],
+        next_owner=outcome["next_owner"],
+        parked=bool(outcome["parked"]),
+    )
+    return _report_finish(args, payload, 0)
+
+
+# --------------------------------------------------------------------------- recap
+
+
+def _recap_payload(data: dict[str, Any], task_id: str | None) -> dict[str, Any]:
+    history = data["history"]
+    events = [dict(event) for event in history["events"] if event["task_id"] == task_id]
+    handoffs = [event for event in events if event["lease"] == "released"]
+    reviews = [
+        event
+        for event in events
+        if event["action"] == "advance"
+        and (
+            (
+                event["from_phase"] in {"plan_redlining", "impl_redlining"}
+                and event["verdict"] is not None
+            )
+            or (event["from_phase"] == "reviewing" and event["outcome"] is not None)
+        )
+    ]
+    completion = next(
+        (event for event in reversed(events) if event["action"] == "finish"), None
+    )
+    artifacts = list(
+        dict.fromkeys(path for event in events for path in event["artifacts"])
+    )
+    return {
+        "available": bool(events),
+        "task_id": task_id,
+        "truncated": history["truncated"],
+        "earliest_available_rev": history["earliest_rev"],
+        "latest_available_rev": (
+            history["events"][-1]["rev"] if history["events"] else None
+        ),
+        "event_count": len(events),
+        "lifecycle": events,
+        "handoffs": handoffs,
+        "reviews": reviews,
+        "completion": completion,
+        "artifacts": artifacts,
+    }
+
+
+def _print_recap(payload: dict[str, Any]) -> None:
+    print(
+        f"task={payload['task_id'] or '—'} "
+        f"available={'yes' if payload['available'] else 'no'} "
+        f"events={payload['event_count']} truncated="
+        f"{'yes' if payload['truncated'] else 'no'} "
+        f"earliest={payload['earliest_available_rev'] or '—'} "
+        f"latest={payload['latest_available_rev'] or '—'}"
+    )
+    for event in payload["lifecycle"]:
+        round_value = event["round"] if event["round"] is not None else "—"
+        print(
+            f"  rev={event['rev']} at={event['at']} actor={event['actor']} "
+            f"action={event['action']} phase={event['from_phase']}->{event['phase']} "
+            f"mode={event['mode']} lease={event['lease']} "
+            f"verdict={event['verdict'] or '—'} round={round_value} "
+            f"outcome={event['outcome'] or '—'}"
+        )
+    if payload["artifacts"]:
+        print("artifacts:")
+        for path in payload["artifacts"]:
+            print(f"  - {path}")
+
+
+def cmd_recap(args: argparse.Namespace) -> int:
+    """Read the bounded factual lifecycle history without touching runtime files."""
+    root = _root(args)
+    data = state.load(root)
+    state.validate(data)
+    requested = args.task_id
+    if requested is None:
+        current_id = state.task(data).get("id")
+        requested = current_id if isinstance(current_id, str) and current_id else None
+    payload = _recap_payload(data, requested)
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        _print_recap(payload)
+    return 0
 
 
 # --------------------------------------------------------------------------- set
@@ -1395,6 +1840,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--artifact", help="redline path, relative to the board or absolute")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_advance)
+
+    p = subs.add_parser("finish", parents=[common], help="complete done work and hand off queue")
+    p.add_argument("agent")
+    p.add_argument("--rev", type=int, required=True, help="done revision returned by brief/advance")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_finish)
+
+    p = subs.add_parser("recap", parents=[common], help="read bounded factual task history")
+    p.add_argument("task_id", nargs="?")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_recap)
 
     p = subs.add_parser("set", parents=[common], help="move the baton or change config")
     p.add_argument("--agent", help="who is acting")

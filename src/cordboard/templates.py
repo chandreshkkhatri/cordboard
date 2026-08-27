@@ -62,6 +62,7 @@ def blank_board(workflow: str, reviewer: str, author: str) -> dict[str, Any]:
         "lease_seconds": state.DEFAULT_LEASE_SECONDS,
         "stall_after_seconds": state.DEFAULT_STALL_AFTER_SECONDS,
         "rev": 0,
+        "history": {"events": [], "truncated": False, "earliest_rev": None},
         "roles": {"reviewer": reviewer, "author": author},
         "agents": {
             reviewer: blank_agent(),
@@ -88,8 +89,8 @@ def blank_board(workflow: str, reviewer: str, author: str) -> dict[str, Any]:
 STACK_TEMPLATE = """# Task stack
 
 **LIFO — the bottom-most task is picked first.** Add new work at the bottom; `cordboard task start`
-picks it and `cordboard task complete` checks it off. Keep each entry to one line plus optional
-indented notes; anything longer belongs in a plan.
+picks it and agent-facing `cordboard finish` checks it off. Keep each entry to one line plus
+optional indented notes; anything longer belongs in a plan.
 
 Format: `- [ ] <short-id> — <what needs to be true when this is done>`
 
@@ -147,11 +148,16 @@ def init_board(
 
 
 def _migrate_v3(root: str, old: dict[str, Any]) -> str:
-    """v3 -> v4: the either/or `trigger` becomes watch-primary plus a backstop tick."""
+    """v3 -> current: add watch-primary backstops and the factual history ring."""
     fresh = dict(old)
     fresh["version"] = state.SCHEMA_VERSION
     fresh.setdefault("stall_after_seconds", state.DEFAULT_STALL_AFTER_SECONDS)
     fresh.setdefault("task", {}).setdefault("handoff_at", None)
+    fresh["history"] = {
+        "events": [],
+        "truncated": bool(int(old.get("rev", 0))),
+        "earliest_rev": None,
+    }
 
     upgraded = {}
     for name, block in (old.get("agents") or {}).items():
@@ -170,6 +176,21 @@ def _migrate_v3(root: str, old: dict[str, Any]) -> str:
     )
 
 
+def _migrate_v4(root: str, old: dict[str, Any]) -> str:
+    """v4 -> v5: add an honest empty history ring without inventing old events."""
+    fresh = dict(old)
+    fresh["version"] = state.SCHEMA_VERSION
+    fresh["history"] = {
+        "events": [],
+        "truncated": bool(int(old.get("rev", 0))),
+        "earliest_rev": None,
+    }
+    if os.path.exists(state.status_path(root)):
+        shutil.copyfile(state.status_path(root), state.status_path(root) + ".v4.bak")
+    state.write_atomic(root, fresh)
+    return f"migrated v4 -> v{state.SCHEMA_VERSION}: factual history starts empty"
+
+
 def migrate_v2(root: str, legacy: str) -> str:
     """Import a v2 board. Returns a human-readable report of what carried over."""
     source = state.status_path(legacy)
@@ -184,6 +205,8 @@ def migrate_v2(root: str, legacy: str) -> str:
 
     if version == 3:
         return _migrate_v3(root, old)
+    if version == 4:
+        return _migrate_v4(root, old)
 
     # v2's `mode` is not carried across: solo is now expressed by pointing both
     # roles at one agent, so the field has nowhere to go and needs nowhere to go.
@@ -201,6 +224,7 @@ def migrate_v2(root: str, legacy: str) -> str:
     fresh["max_rounds"] = int(old.get("max_rounds", state.DEFAULT_MAX_ROUNDS))
     fresh["lease_seconds"] = int(old.get("lease_seconds", state.DEFAULT_LEASE_SECONDS))
     fresh["rev"] = int(old.get("rev", 0))
+    fresh["history"]["truncated"] = bool(fresh["rev"])
     fresh["lock"] = old.get("lock") or fresh["lock"]
 
     old_task = old.get("task") or {}

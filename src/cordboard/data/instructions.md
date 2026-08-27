@@ -1,4 +1,4 @@
-# cordboard — protocol specification (schema v4)
+# cordboard — protocol specification (schema v5)
 
 This document defines the coordination protocol, state machine, and safety rules that let two
 coding agents work a shared task backlog without stepping on each other.
@@ -87,7 +87,7 @@ one machine's runtime state. Committing `status.json` would mean merge conflicts
 
 ```json
 {
-  "version": 4,
+  "version": 5,
   "enabled": false,
   "workflow": "redline",
   "auto_commit": true,
@@ -95,6 +95,11 @@ one machine's runtime state. Committing `status.json` would mean merge conflicts
   "lease_seconds": 5400,
   "stall_after_seconds": 600,
   "rev": 0,
+  "history": {
+    "events": [],
+    "truncated": false,
+    "earliest_rev": null
+  },
   "roles": {
     "reviewer": "cc",
     "author": "ag"
@@ -147,6 +152,9 @@ one machine's runtime state. Committing `status.json` would mean merge conflicts
 | `enabled` | Master switch. False makes every tick a no-op and every `wait` exit 10. |
 | `workflow` | `relay` or `redline` — which phase graph applies. |
 | `rev` | Bumped on every write. The compare-and-swap reads it; never set it by hand. |
+| `history` | At most 128 machine-authored lifecycle facts; old entries fall off as a ring. |
+| `history.truncated` | Whether lifecycle facts existed before the retained window. |
+| `history.earliest_rev` | Earliest retained event revision, or null when no event is available. |
 | `roles` | Role → agent name. Both roles must be filled for the board to run. |
 | `agents.<name>.watch` | Whether this agent reacts to handoffs via `cordboard wait`. Default true. |
 | `agents.<name>.tick` | Backstop schedule, or null. An agent needs at least one of these two. |
@@ -188,6 +196,8 @@ compare-and-swap. Hand-editing races with a live agent and silently loses writes
 | `cordboard brief <agent>` | Return that agent's bounded, strictly read-only handoff |
 | `cordboard take <agent>` | Atomically acquire actionable work and return its post-take brief |
 | `cordboard advance <agent> --rev REV` | Atomically finish one already-taken work beat |
+| `cordboard finish <agent> --rev REV` | Retry-safely complete done work and hand off the queue |
+| `cordboard recap [TASK_ID]` | Read the bounded factual lifecycle of one task; never writes |
 | `cordboard set` | Write state. Refuses out-of-turn moves and illegal transitions unless `--force` |
 | `cordboard wait <agent>` | Block until it is that agent's turn. This is `watch` |
 | `cordboard say` | Append to / read the chat back-channel |
@@ -218,8 +228,17 @@ The full specification is bootstrap and recovery material, not a per-wake contex
 safe transitions, and unread chat. `--json` emits the same contract for wrappers.
 
 Brief is strictly read-only: it creates no lock, advances no chat cursor, and changes no file. It
-reads and validates the board, TODO stack, and chat before printing anything; malformed input exits
-`2` without a partial brief. An unknown agent exits `1` without stdout.
+validates board state and the named agent first. Invalid state exits `2` without a partial brief; an
+unknown agent exits `1` without stdout. TODO and chat are ancillary during active work, so their
+failure is reported in `board.warnings` rather than promoted to a board failure. Every warning has
+exactly `source`, `code`, and `message`. TODO uses `missing`, `invalid_utf8`, `invalid`, or
+`unreadable`; chat uses `invalid_utf8` or `unreadable`.
+
+A missing chat file is healthy empty context: `chat.available=true`, `unread=""`, and
+`available_through=0`, with no warning. `chat.available=false` and
+`available_through=null` are reserved for a malformed or unreadable existing log, which is warned.
+Neither command creates, repairs, consumes, or advances a cursor in these files, and neither infers
+a fallback task from TODO.
 
 Wrappers branch on `turn.disposition`, evaluated in this precedence order:
 
@@ -260,14 +279,22 @@ because their verdict determines the successor. Planning/drafting acquisition fi
 `taken_from`, `rev`, `phase`, `lease_holder`, `lease_expires_at`, and `brief`. Successful mode is
 exactly one of `started`, `resumed`, or `claimed`. Expected refusals exit `1`, write no state, and
 use one stable reason: `unknown_agent`, `disabled`, `parked`, `human_required`, `bookkeeping`,
-`not_owner`, `missing_task`, `lease_held`, or `unsupported_phase`. Invalid board, TODO, or chat is
-exit `2` without partial output.
+`not_owner`, `missing_task`, `lease_held`, or `unsupported_phase`. Invalid board state is exit `2`
+without partial output. Missing/malformed TODO or chat follows the degraded ancillary-context
+contract above and does not prevent an otherwise safe active acquisition.
 
-Chat and the candidate post-take brief are read and validated before commit, so successful state
-cannot be followed by an ambiguous output failure. The nested brief is the full committed context
-with already-performed claim and metadata commands removed. Human output renders the same context,
-instructions, and remaining transitions. Take does not consume chat, edit TODO, create artifacts,
-touch git or notes, or require a summary.
+Chat/TODO context and the candidate post-take brief are snapshotted before commit, so successful
+state cannot be followed by an ambiguous output failure or post-commit read. The nested brief is
+the full committed context with already-performed claim and metadata commands removed. Human output
+renders the same context, instructions, and remaining transitions. Take does not consume chat, edit
+TODO, create artifacts, touch git or notes, or require a summary.
+
+State, agent identity, ownership, workflow, phase, revision, and lease rules remain hard gates.
+Existing evidence is also hard-gated: phases after plan authoring require a contained regular,
+non-empty UTF-8 plan; `plan_redlined` and `impl_redlined` additionally require their contained
+stored redline. Missing evidence yields `human_required` and no transition. At `done`, a missing or
+invalid TODO stack likewise yields `human_required` and omits task completion; task mutation
+commands always keep strict TODO validation.
 
 ### Atomic advance
 
@@ -316,6 +343,60 @@ owner, release and lease facts, and the plan/review facts used. Rendering is pur
 Advance creates no summary or note, edits no TODO/chat/artifact/git data, and does not auto-take the
 next owner.
 
+### Revision-bound finish
+
+At `done`, agents use the exact command emitted by brief:
+
+```bash
+cordboard finish <agent> --rev <done-revision>
+```
+
+Finish requires a valid enabled board, a known agent who owns the current `done` phase, the exact
+revision, a non-empty task id, and a valid TODO containing that task. It has no `--next` option: it
+always checks off the completed task and installs the bottom-most remaining pending task at the
+workflow entry phase, or sets the phase to `idle` when none remains. The new owner receives no
+lease; it must run `take` normally.
+
+The operation holds locks in status-then-TODO order, rechecks state and revision under the status
+lock, and writes exactly one new state revision. TODO must land first, so a process crash can leave
+the checkbox written while state remains at the same done revision. Retrying the identical command
+recognizes that checked task, reports `recovered=true`, and completes the state handoff. Same-revision
+contention produces one success; a retry after the state commit refuses `revision_mismatch` rather
+than touching the successor.
+
+`finish --json` has stable `finished`, `reason`, `message`, `expected_rev`, `rev`, `agent`,
+`completed_task`, `todo_changed`, `recovered`, `next_task`, `next_phase`, `next_owner`, and `parked`
+fields. Expected refusals exit `1` without writes and use `unknown_agent`, `disabled`,
+`revision_mismatch`, `not_done`, `not_owner`, `missing_task`, or `task_not_in_todo`. Invalid board or
+broken TODO input exits `2` with no partial output; a broken TODO is fully validated before its
+checkbox changes.
+
+Finish never invokes git, produces a summary, consumes chat, creates artifacts, or auto-takes/leases
+the next task. `cordboard task complete [--next]` remains the human override for deliberately manual
+queue control; it is not emitted to agents.
+
+### Bounded factual recap
+
+`cordboard recap [TASK_ID] [--json]` reconstructs a task's retained lifecycle without requiring
+incremental agent summaries. With no task ID it uses the current task ID only; it never infers a
+task from TODO. The command is strictly read-only: it creates no lock, advances no cursor, and
+writes no file.
+
+`take`, `advance`, and `finish` each append one event in the same atomic `status.json` write as the
+transition. Events contain only revision/time, task ID/title, actor/action, phase transition/mode,
+verdict/round/outcome, lease disposition, and referenced task artifact paths. Event text is never
+accepted from an agent. Chat, notes, artifact content, summaries, prose, and git diff content are
+not copied into history.
+
+The ring retains at most 128 events. Recap reports `truncated`, `earliest_available_rev`, and
+`latest_available_rev` from the global retained window, so it never implies older facts remain.
+Its `reviews` view contains decision events only: redline gate advances from `plan_redlining` or
+`impl_redlining`, and relay advances from `reviewing` with a clean/issues outcome. Stored verdicts
+carried through later response or completion events do not create duplicate reviews.
+`available=false` and empty lifecycle/handoff/review/completion data mean no event for the requested
+task is retained. Migrating an already-used older board starts with an empty ring and
+`truncated=true`; Cordboard does not fabricate history for earlier revisions.
+
 ### What `cordboard set` refuses
 
 Two independent guards, both bypassable with `--force` (the human override):
@@ -356,7 +437,8 @@ awaiting_plan (next) / idle
 first if it is too large, appending subtasks at the bottom), write `plan.md`, move to `plan_ready`. At
 `awaiting_review`: audit `git diff`, run the plan's verification gates; if clean, move to `done`,
 then apply the conservative commit-scope policy (when `auto_commit`) and run
-`cordboard task complete --next`; if not, write a fix-plan and return to `plan_ready`.
+`cordboard finish <agent> --rev <done-revision>`; if not, write a fix-plan and return to
+`plan_ready`.
 
 **Author tick.** At `plan_ready`: read `plan.md`, implement, run the plan's verification steps, move
 to `awaiting_review` — or to `blocked` with a note if stuck.
@@ -389,7 +471,7 @@ awaiting_draft ─(author)─▶ drafting ─(author)─▶ plan_submitted
                                      ┌───── verdict=reject ──────────────────────┤
                                      │  (author revises, re-review)               │ approve / revise
                                      ▼                                            ▼
-                              impl_submitted                    done ─(task complete --next)─▶ awaiting_draft / idle
+                              impl_submitted                    done ─(finish --rev)─▶ awaiting_draft / idle
 ```
 
 | Phase | Owner |
@@ -400,7 +482,7 @@ awaiting_draft ─(author)─▶ drafting ─(author)─▶ plan_submitted
 
 `done` is not terminal: it is the bookkeeping beat where the finishing agent conservatively
 determines commit ownership, commits only when allowed and unambiguous, runs
-`cordboard task complete --next`, and either queues the next task or rests. `idle` is the resting
+`cordboard finish <agent> --rev <done-revision>`, and either queues the next task or rests. `idle` is the resting
 state. This bookkeeping can reconstruct scope from durable task artifacts and the current diff; it
 does not depend on incremental summaries.
 
@@ -421,7 +503,7 @@ does not depend on incremental summaries.
 * **`impl_redlined`** — claim, apply the comments in `task.last_redline` to the code. Then:
   * `reject` → back to `impl_submitted` for another round.
   * `approve` / `revise` → move to `done`, apply the conservative commit-scope policy (when
-    `auto_commit`), then run `cordboard task complete --next`.
+    `auto_commit`), then run `cordboard finish <agent> --rev <done-revision>`.
 * **`drafting` / `implementing` found on entry** — watchdog: the previous tick died mid-phase.
   Refresh the heartbeat and resume the same work.
 
