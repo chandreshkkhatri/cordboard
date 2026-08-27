@@ -269,6 +269,7 @@ def test_empty_recap_is_explicitly_unavailable_and_human_output_is_stable(board,
         "available": False,
         "task_id": "never-seen",
         "truncated": False,
+        "incomplete_through_rev": None,
         "earliest_available_rev": None,
         "latest_available_rev": None,
         "event_count": 0,
@@ -308,7 +309,12 @@ def test_recap_is_zero_write_and_creates_no_locks(tmp_path, capsys):
 def test_history_ring_is_bounded_and_reports_the_honest_boundary():
     data = {
         "rev": 0,
-        "history": {"events": [], "truncated": False, "earliest_rev": None},
+        "history": {
+            "events": [],
+            "truncated": False,
+            "earliest_rev": None,
+            "incomplete_through_rev": None,
+        },
     }
     for _index in range(state.HISTORY_CAP + 2):
         state.record_history_event(
@@ -327,6 +333,7 @@ def test_history_ring_is_bounded_and_reports_the_honest_boundary():
     history = data["history"]
     assert len(history["events"]) == state.HISTORY_CAP
     assert history["truncated"] is True
+    assert history["incomplete_through_rev"] == 2
     assert history["earliest_rev"] == 3
     assert history["events"][0]["rev"] == 3
     assert history["events"][-1]["rev"] == state.HISTORY_CAP + 2
@@ -382,4 +389,40 @@ def test_malformed_history_has_no_partial_recap_output(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "invalid board" in captured.err
+    assert message in captured.err
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    (
+        ("missing", "history must contain exactly the bounded history fields"),
+        ("negative", "history.incomplete_through_rev must be a non-negative integer or null"),
+        ("future", "history.incomplete_through_rev cannot exceed board rev"),
+        ("unexpected", "must be null when history is not truncated"),
+        ("required", "is required when history is truncated"),
+    ),
+)
+def test_history_loss_boundary_is_strictly_validated(
+    board, capsys, damage, message
+):
+    data = state.load(board)
+    if damage == "missing":
+        data["history"].pop("incomplete_through_rev")
+    elif damage == "negative":
+        data["history"].update(
+            {"truncated": True, "incomplete_through_rev": -1}
+        )
+    elif damage == "future":
+        data["history"].update(
+            {"truncated": True, "incomplete_through_rev": data["rev"] + 1}
+        )
+    elif damage == "unexpected":
+        data["history"]["incomplete_through_rev"] = data["rev"]
+    else:
+        data["history"]["truncated"] = True
+    state.write_atomic(board, data)
+
+    assert main(["--dir", board, "recap", "--json"]) == EXIT_BAD_STATE
+    captured = capsys.readouterr()
+    assert captured.out == ""
     assert message in captured.err

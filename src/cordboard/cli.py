@@ -26,11 +26,14 @@ from .workflows import (
     FINISH_REFUSALS,
     IN_PROGRESS,
     PHASES,
+    RENEW_PHASES,
+    RENEW_REFUSALS,
     ROLES,
     TAKE_MODES,
     TAKE_PHASES,
     TAKE_REFUSALS,
     VERDICTS,
+    WORK_MODES,
 )
 
 # cordboard wait exit codes. These are the contract an agent's tick script reads,
@@ -681,6 +684,121 @@ def _report_take(args: argparse.Namespace, payload: dict[str, Any], code: int) -
     return code
 
 
+def _acquire_work_data(
+    root: str,
+    data: dict[str, Any],
+    agent: str,
+    *,
+    todo_available: bool,
+    unread: str,
+    available_through: int | None,
+    chat_available: bool,
+    warnings: list[dict[str, str]],
+    refusal: dict[str, str | None],
+    outcome: dict[str, Any],
+) -> bool | None:
+    """Apply the one canonical take mutation to a validated state draft."""
+
+    def refuse(reason: str, message: str, phase: str | None) -> bool:
+        assert reason in TAKE_REFUSALS
+        refusal.update({"reason": reason, "message": message, "phase": phase})
+        return False
+
+    state.validate(data)
+    current = state.phase(data)
+    refusal["phase"] = current
+    if agent not in state.agents(data):
+        return refuse("unknown_agent", f"unknown agent {agent!r}", current)
+    if not data.get("enabled"):
+        return refuse("disabled", "board is disabled", current)
+    if current == "idle":
+        return refuse("parked", "no task currently holds the baton", current)
+    if current == "blocked":
+        return refuse("human_required", "blocked task needs an operator decision", current)
+    if current == "done":
+        if not todo_available:
+            return refuse(
+                "human_required",
+                "task completion needs a valid TODO stack; ask an operator to repair it",
+                current,
+            )
+        return refuse(
+            "bookkeeping",
+            "phase done needs `cordboard finish`, not a work lease",
+            current,
+        )
+    owner = roles.owner(data)
+    if owner != agent:
+        return refuse("not_owner", f"waiting for {owner}", current)
+    current_task = state.task(data)
+    if not isinstance(current_task.get("id"), str) or not current_task["id"].strip():
+        return refuse("missing_task", "active work needs a non-empty task id", current)
+    hard_reason = _required_artifact_error(root, data)
+    disposition, why = _brief_disposition(data, agent, owner, current, hard_reason)
+    if disposition == "human_required":
+        return refuse("human_required", why, current)
+
+    flow = roles.workflow(data)
+    if current in IN_PROGRESS:
+        target = current
+        mode, started, resumed = "resumed", False, True
+    elif current in TAKE_PHASES[flow]:
+        target = TAKE_PHASES[flow][current]
+        if target == current:
+            mode, started, resumed = "claimed", False, False
+        else:
+            mode, started, resumed = "started", True, False
+    else:
+        return refuse(
+            "unsupported_phase", f"phase {current} cannot be acquired with take", current
+        )
+
+    holder = (data.get("lock") or {}).get("holder")
+    if holder and holder != agent and not state.lease_expired(data):
+        return refuse("lease_held", f"lease is held by {holder!r}", current)
+    allowed, why = roles.can_move(data, target)
+    if not allowed:
+        raise state.StateError(why)
+    current_task["phase"] = target
+    if target in {"planning", "drafting"}:
+        task_dir = current_task.get("dir") or f"plans/{_safe_task_id(current_task['id'])}"
+        current_task["dir"] = task_dir
+        current_task["plan_file"] = current_task.get("plan_file") or f"{task_dir}/plan.md"
+    state.claim_lease(data, agent)
+    state.touch(data, agent, status="working")
+    outcome.update(
+        {
+            "mode": mode,
+            "started": started,
+            "resumed": resumed,
+            "taken_from": current,
+            "brief": _brief_payload(
+                root,
+                data,
+                agent,
+                unread,
+                available_through,
+                chat_available=chat_available,
+                warnings=warnings,
+                acquisition_mode=mode,
+            ),
+        }
+    )
+    state.record_history_event(
+        data,
+        task_id=current_task["id"],
+        task_title=current_task.get("title"),
+        actor=agent,
+        action="take",
+        from_phase=current,
+        phase=target,
+        mode=mode,
+        lease="claimed",
+        artifacts=_artifact_refs(current_task),
+    )
+    return None
+
+
 def cmd_take(args: argparse.Namespace) -> int:
     """Atomically convert an actionable handoff into agent-owned work."""
     root = _root(args)
@@ -708,107 +826,19 @@ def cmd_take(args: argparse.Namespace) -> int:
     refusal: dict[str, str | None] = {"reason": None, "message": None, "phase": None}
     outcome: dict[str, Any] = {}
 
-    def refuse(reason: str, message: str, phase: str | None) -> bool:
-        assert reason in TAKE_REFUSALS
-        refusal.update({"reason": reason, "message": message, "phase": phase})
-        return False
-
     def take(data: dict[str, Any]) -> Any:
-        state.validate(data)
-        current = state.phase(data)
-        refusal["phase"] = current
-        if args.agent not in state.agents(data):
-            return refuse("unknown_agent", f"unknown agent {args.agent!r}", current)
-        if not data.get("enabled"):
-            return refuse("disabled", "board is disabled", current)
-        if current == "idle":
-            return refuse("parked", "no task currently holds the baton", current)
-        if current == "blocked":
-            return refuse("human_required", "blocked task needs an operator decision", current)
-        if current == "done":
-            if not todo_available:
-                return refuse(
-                    "human_required",
-                    "task completion needs a valid TODO stack; ask an operator to repair it",
-                    current,
-                )
-            return refuse(
-                "bookkeeping",
-                "phase done needs `cordboard task complete --next`, not a work lease",
-                current,
-            )
-        owner = roles.owner(data)
-        if owner != args.agent:
-            return refuse("not_owner", f"waiting for {owner}", current)
-        current_task = state.task(data)
-        if not isinstance(current_task.get("id"), str) or not current_task["id"].strip():
-            return refuse("missing_task", "active work needs a non-empty task id", current)
-        hard_reason = _required_artifact_error(root, data)
-        disposition, why = _brief_disposition(
-            data, args.agent, owner, current, hard_reason
-        )
-        if disposition == "human_required":
-            return refuse("human_required", why, current)
-
-        flow = roles.workflow(data)
-        if current in IN_PROGRESS:
-            target = current
-            mode, started, resumed = "resumed", False, True
-        elif current in TAKE_PHASES[flow]:
-            target = TAKE_PHASES[flow][current]
-            if target == current:
-                mode, started, resumed = "claimed", False, False
-            else:
-                mode, started, resumed = "started", True, False
-        else:
-            return refuse(
-                "unsupported_phase", f"phase {current} cannot be acquired with take", current
-            )
-
-        holder = (data.get("lock") or {}).get("holder")
-        if holder and holder != args.agent and not state.lease_expired(data):
-            return refuse("lease_held", f"lease is held by {holder!r}", current)
-        allowed, why = roles.can_move(data, target)
-        if not allowed:
-            raise state.StateError(why)
-        current_task["phase"] = target
-        if target in {"planning", "drafting"}:
-            task_dir = current_task.get("dir") or f"plans/{_safe_task_id(current_task['id'])}"
-            current_task["dir"] = task_dir
-            current_task["plan_file"] = current_task.get("plan_file") or f"{task_dir}/plan.md"
-        state.claim_lease(data, args.agent)
-        state.touch(data, args.agent, status="working")
-        outcome.update(
-            {
-                "mode": mode,
-                "started": started,
-                "resumed": resumed,
-                "taken_from": current,
-                "brief": _brief_payload(
-                    root,
-                    data,
-                    args.agent,
-                    initial_unread,
-                    initial_available,
-                    chat_available=chat_available,
-                    warnings=warnings,
-                    acquisition_mode=mode,
-                ),
-            }
-        )
-        state.record_history_event(
+        return _acquire_work_data(
+            root,
             data,
-            task_id=current_task["id"],
-            task_title=current_task.get("title"),
-            actor=args.agent,
-            action="take",
-            from_phase=current,
-            phase=target,
-            mode=mode,
-            lease="claimed",
-            artifacts=_artifact_refs(current_task),
+            args.agent,
+            todo_available=todo_available,
+            unread=initial_unread,
+            available_through=initial_available,
+            chat_available=chat_available,
+            warnings=warnings,
+            refusal=refusal,
+            outcome=outcome,
         )
-        return None
 
     data, written = state.update(root, take, actor=args.agent)
     lock = data.get("lock") or {}
@@ -842,6 +872,354 @@ def cmd_take(args: argparse.Namespace) -> int:
         brief=outcome["brief"],
     )
     return _report_take(args, payload, 0)
+
+
+# --------------------------------------------------------------------------- work
+
+
+def _work_envelope(
+    *,
+    acquired: bool,
+    mode: str,
+    reason: str,
+    data: dict[str, Any],
+    brief: dict[str, Any] | None,
+) -> dict[str, Any]:
+    lock = data.get("lock") or {}
+    return {
+        "acquired": acquired,
+        "mode": mode,
+        "reason": reason,
+        "rev": data["rev"],
+        "phase": state.phase(data),
+        "lease_holder": lock.get("holder"),
+        "lease_expires_at": lock.get("expires_at"),
+        "brief": brief,
+    }
+
+
+def _report_work(args: argparse.Namespace, payload: dict[str, Any], code: int = 0) -> int:
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    elif payload["brief"] is None:
+        print(f"cordboard: {payload['reason']}", file=sys.stderr)
+    else:
+        status = "acquired" if payload["acquired"] else "observed"
+        print(
+            f"cordboard: {status} mode={payload['mode']} reason={payload['reason']} "
+            f"phase={payload['phase']} rev={payload['rev']}"
+        )
+        _print_brief(payload["brief"])
+    return code
+
+
+def _work_brief(
+    root: str,
+    data: dict[str, Any],
+    agent: str,
+    *,
+    todo_available: bool,
+    unread: str,
+    available_through: int | None,
+    chat_available: bool,
+    warnings: list[dict[str, str]],
+    refusal_reason: str | None = None,
+    refusal_message: str | None = None,
+) -> dict[str, Any]:
+    hard_reason = _required_artifact_error(root, data)
+    current = state.phase(data)
+    current_task = state.task(data)
+    if current == "done" and not todo_available:
+        hard_reason = "task completion needs a valid TODO stack; ask an operator to repair it"
+    elif current not in {"idle", "blocked", "done"} and (
+        not isinstance(current_task.get("id"), str) or not current_task["id"].strip()
+    ):
+        hard_reason = "active work needs a non-empty task id"
+    elif refusal_reason in {"lease_held", "unsupported_phase"}:
+        hard_reason = refusal_message
+    return _brief_payload(
+        root,
+        data,
+        agent,
+        unread,
+        available_through,
+        chat_available=chat_available,
+        warnings=warnings,
+        hard_reason=hard_reason,
+    )
+
+
+def _passive_work_reason(data: dict[str, Any], brief: dict[str, Any]) -> str | None:
+    """Return a wake outcome, or None when the snapshot should attempt acquisition."""
+    disposition = brief["turn"]["disposition"]
+    if state.phase(data) == "done" and disposition != "human_required":
+        return "done"
+    return None if disposition in {"act", "resume"} else str(disposition)
+
+
+def cmd_work(args: argparse.Namespace) -> int:
+    """Observe passive state or atomically acquire the current agent's work."""
+    root = _root(args)
+    initial = state.load(root)
+    state.validate(initial)
+    if args.agent not in state.agents(initial):
+        payload = _work_envelope(
+            acquired=False,
+            mode="observed",
+            reason="unknown_agent",
+            data=initial,
+            brief=None,
+        )
+        return _report_work(args, payload, EXIT_REFUSED)
+
+    (
+        todo_available,
+        unread,
+        available_through,
+        chat_available,
+        warnings,
+    ) = _ancillary_context(root, initial, args.agent)
+    initial_brief = _work_brief(
+        root,
+        initial,
+        args.agent,
+        todo_available=todo_available,
+        unread=unread,
+        available_through=available_through,
+        chat_available=chat_available,
+        warnings=warnings,
+    )
+    passive_reason = _passive_work_reason(initial, initial_brief)
+    if passive_reason is not None:
+        payload = _work_envelope(
+            acquired=False,
+            mode="observed",
+            reason=passive_reason,
+            data=initial,
+            brief=initial_brief,
+        )
+        return _report_work(args, payload)
+
+    refusal: dict[str, str | None] = {"reason": None, "message": None, "phase": None}
+    outcome: dict[str, Any] = {}
+
+    def work(data: dict[str, Any]) -> Any:
+        if args.agent not in state.agents(data):
+            refusal.update(
+                {
+                    "reason": "unknown_agent",
+                    "message": f"unknown agent {args.agent!r}",
+                    "phase": state.phase(data),
+                }
+            )
+            return False
+        if data["rev"] != initial["rev"]:
+            (
+                current_todo_available,
+                current_unread,
+                current_available_through,
+                current_chat_available,
+                current_warnings,
+            ) = _ancillary_context(root, data, args.agent)
+            outcome["brief"] = _work_brief(
+                root,
+                data,
+                args.agent,
+                todo_available=current_todo_available,
+                unread=current_unread,
+                available_through=current_available_through,
+                chat_available=current_chat_available,
+                warnings=current_warnings,
+            )
+            outcome["reason"] = "state_changed"
+            return False
+        acquired = _acquire_work_data(
+            root,
+            data,
+            args.agent,
+            todo_available=todo_available,
+            unread=unread,
+            available_through=available_through,
+            chat_available=chat_available,
+            warnings=warnings,
+            refusal=refusal,
+            outcome=outcome,
+        )
+        if acquired is False and args.agent in state.agents(data):
+            outcome["brief"] = _work_brief(
+                root,
+                data,
+                args.agent,
+                todo_available=todo_available,
+                unread=unread,
+                available_through=available_through,
+                chat_available=chat_available,
+                warnings=warnings,
+                refusal_reason=refusal["reason"],
+                refusal_message=refusal["message"],
+            )
+            outcome["reason"] = refusal["reason"]
+        return acquired
+
+    data, written = state.update(root, work, actor=args.agent)
+    if not written:
+        brief = outcome.get("brief")
+        reason = str(outcome.get("reason") or refusal["reason"] or "state_changed")
+        payload = _work_envelope(
+            acquired=False,
+            mode="observed",
+            reason=reason,
+            data=data,
+            brief=brief,
+        )
+        code = EXIT_REFUSED if brief is None else 0
+        return _report_work(args, payload, code)
+
+    mode = str(outcome["mode"])
+    assert mode in TAKE_MODES
+    outcome["brief"]["board"]["rev"] = data["rev"]
+    payload = _work_envelope(
+        acquired=True,
+        mode=mode,
+        reason=mode,
+        data=data,
+        brief=outcome["brief"],
+    )
+    assert payload["mode"] in WORK_MODES
+    return _report_work(args, payload)
+
+
+# --------------------------------------------------------------------------- renew
+
+
+def _renew_envelope(
+    *,
+    renewed: bool = False,
+    reason: str,
+    message: str,
+    expected_rev: int,
+    rev: int,
+    agent: str,
+    phase: str,
+    lease_holder: str | None,
+    lease_expires_at: str | None,
+    advance_commands: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "renewed": renewed,
+        "reason": reason,
+        "message": message,
+        "expected_rev": expected_rev,
+        "rev": rev,
+        "agent": agent,
+        "phase": phase,
+        "lease_holder": lease_holder,
+        "lease_expires_at": lease_expires_at,
+        "superseded_rev": expected_rev if renewed else None,
+        "old_advance_rev_valid": False if renewed else None,
+        "advance_commands": advance_commands or [],
+    }
+
+
+def _report_renew(args: argparse.Namespace, payload: dict[str, Any], code: int) -> int:
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    elif code == 0:
+        print(
+            f"cordboard: renewed agent={payload['agent']} phase={payload['phase']} "
+            f"rev={payload['rev']} lease={payload['lease_holder']} "
+            f"until={payload['lease_expires_at']}"
+        )
+        print(
+            f"superseded_rev={payload['superseded_rev']} "
+            "old_advance_rev_valid=no"
+        )
+        print("advance:")
+        for command in payload["advance_commands"]:
+            print(f"  - {command}")
+    else:
+        print(f"cordboard: {payload['message']}", file=sys.stderr)
+    return code
+
+
+def cmd_renew(args: argparse.Namespace) -> int:
+    """Extend live acquired work while replacing its revision token."""
+    root = _root(args)
+    refusal: dict[str, str | None] = {"reason": None, "message": None}
+    outcome: dict[str, Any] = {}
+
+    def refuse(reason: str, message: str) -> bool:
+        assert reason in RENEW_REFUSALS
+        refusal.update({"reason": reason, "message": message})
+        return False
+
+    def renew(data: dict[str, Any]) -> Any:
+        if args.agent not in state.agents(data):
+            return refuse("unknown_agent", f"unknown agent {args.agent!r}")
+        if not data.get("enabled"):
+            return refuse("disabled", "board is disabled")
+        if data["rev"] != args.rev:
+            return refuse(
+                "revision_mismatch",
+                f"expected rev {args.rev}, found {data['rev']}; use the latest work/renew output",
+            )
+        current = state.phase(data)
+        owner = roles.owner(data)
+        if owner != args.agent:
+            return refuse("not_owner", f"waiting for {owner}")
+        current_task = state.task(data)
+        task_id = current_task.get("id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            return refuse("missing_task", "active work needs a non-empty task id")
+        if current not in RENEW_PHASES:
+            return refuse(
+                "unsupported_phase", f"phase {current} is not acquired renewable work"
+            )
+        holder = (data.get("lock") or {}).get("holder")
+        if holder is None:
+            return refuse("lease_missing", "work has no lease; recover with work or take")
+        if state.lease_expired(data):
+            return refuse("lease_expired", "work lease expired; recover with work or take")
+        if holder != args.agent:
+            return refuse(
+                "lease_foreign",
+                f"lease is held by {holder!r}; wait for expiry, then recover with work or take",
+            )
+
+        state.claim_lease(data, args.agent)
+        state.touch(data, args.agent, status="working")
+        outcome.update({"phase": current})
+        return None
+
+    data, written = state.update(root, renew, actor=args.agent)
+    lock = data.get("lock") or {}
+    if not written:
+        payload = _renew_envelope(
+            reason=str(refusal["reason"] or "unsupported_phase"),
+            message=str(refusal["message"] or "lease could not be renewed"),
+            expected_rev=args.rev,
+            rev=data["rev"],
+            agent=args.agent,
+            phase=state.phase(data),
+            lease_holder=lock.get("holder"),
+            lease_expires_at=lock.get("expires_at"),
+        )
+        return _report_renew(args, payload, EXIT_REFUSED)
+
+    current = str(outcome["phase"])
+    payload = _renew_envelope(
+        renewed=True,
+        reason="renewed",
+        message=f"renewed task {state.task(data)['id']}",
+        expected_rev=args.rev,
+        rev=data["rev"],
+        agent=args.agent,
+        phase=current,
+        lease_holder=lock.get("holder"),
+        lease_expires_at=lock.get("expires_at"),
+        advance_commands=_advance_commands(root, data, args.agent, current, data["rev"]),
+    )
+    return _report_renew(args, payload, 0)
 
 
 # --------------------------------------------------------------------------- advance
@@ -1368,9 +1746,8 @@ def cmd_finish(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- recap
 
 
-def _recap_payload(data: dict[str, Any], task_id: str | None) -> dict[str, Any]:
-    history = data["history"]
-    events = [dict(event) for event in history["events"] if event["task_id"] == task_id]
+def _history_task_view(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Derive factual task views once for recap and digest."""
     handoffs = [event for event in events if event["lease"] == "released"]
     reviews = [
         event
@@ -1391,13 +1768,6 @@ def _recap_payload(data: dict[str, Any], task_id: str | None) -> dict[str, Any]:
         dict.fromkeys(path for event in events for path in event["artifacts"])
     )
     return {
-        "available": bool(events),
-        "task_id": task_id,
-        "truncated": history["truncated"],
-        "earliest_available_rev": history["earliest_rev"],
-        "latest_available_rev": (
-            history["events"][-1]["rev"] if history["events"] else None
-        ),
         "event_count": len(events),
         "lifecycle": events,
         "handoffs": handoffs,
@@ -1407,12 +1777,30 @@ def _recap_payload(data: dict[str, Any], task_id: str | None) -> dict[str, Any]:
     }
 
 
+def _recap_payload(data: dict[str, Any], task_id: str | None) -> dict[str, Any]:
+    history = data["history"]
+    events = [dict(event) for event in history["events"] if event["task_id"] == task_id]
+    view = _history_task_view(events)
+    return {
+        "available": bool(events),
+        "task_id": task_id,
+        "truncated": history["truncated"],
+        "incomplete_through_rev": history["incomplete_through_rev"],
+        "earliest_available_rev": history["earliest_rev"],
+        "latest_available_rev": (
+            history["events"][-1]["rev"] if history["events"] else None
+        ),
+        **view,
+    }
+
+
 def _print_recap(payload: dict[str, Any]) -> None:
     print(
         f"task={payload['task_id'] or '—'} "
         f"available={'yes' if payload['available'] else 'no'} "
         f"events={payload['event_count']} truncated="
         f"{'yes' if payload['truncated'] else 'no'} "
+        f"incomplete_through={payload['incomplete_through_rev'] or '—'} "
         f"earliest={payload['earliest_available_rev'] or '—'} "
         f"latest={payload['latest_available_rev'] or '—'}"
     )
@@ -1445,6 +1833,97 @@ def cmd_recap(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2))
     else:
         _print_recap(payload)
+    return 0
+
+
+# --------------------------------------------------------------------------- digest
+
+
+def _digest_payload(data: dict[str, Any], requested_since: int) -> dict[str, Any]:
+    history = data["history"]
+    retained = history["events"]
+    earliest = history["earliest_rev"]
+    latest = retained[-1]["rev"] if retained else None
+    incomplete_through = history["incomplete_through_rev"]
+    gap = incomplete_through is not None and requested_since < incomplete_through
+
+    selected = [dict(event) for event in retained if event["rev"] > requested_since]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for event in selected:
+        grouped.setdefault(event["task_id"], []).append(event)
+    task_groups = []
+    for task_id, events in grouped.items():
+        task_groups.append(
+            {
+                "task_id": task_id,
+                "task_title": events[0]["task_title"],
+                **_history_task_view(events),
+            }
+        )
+    return {
+        "requested_since": requested_since,
+        "through_rev": data["rev"],
+        "earliest_available_rev": earliest,
+        "latest_available_rev": latest,
+        "truncated": history["truncated"],
+        "incomplete_through_rev": incomplete_through,
+        "gap": gap,
+        "complete": not gap,
+        "event_count": len(selected),
+        "tasks": task_groups,
+    }
+
+
+def _print_digest(payload: dict[str, Any]) -> None:
+    print(
+        f"since={payload['requested_since']} through={payload['through_rev']} "
+        f"complete={'yes' if payload['complete'] else 'no'} "
+        f"gap={'yes' if payload['gap'] else 'no'} "
+        f"truncated={'yes' if payload['truncated'] else 'no'} "
+        f"incomplete_through={payload['incomplete_through_rev'] or '—'} "
+        f"earliest={payload['earliest_available_rev'] or '—'} "
+        f"latest={payload['latest_available_rev'] or '—'} "
+        f"events={payload['event_count']} tasks={len(payload['tasks'])}"
+    )
+    for task in payload["tasks"]:
+        print(
+            f"task={task['task_id']} title={task['task_title'] or '—'} "
+            f"events={task['event_count']} reviews={len(task['reviews'])} "
+            f"handoffs={len(task['handoffs'])} "
+            f"completed={'yes' if task['completion'] else 'no'}"
+        )
+        for event in task["lifecycle"]:
+            round_value = event["round"] if event["round"] is not None else "—"
+            print(
+                f"  rev={event['rev']} at={event['at']} actor={event['actor']} "
+                f"action={event['action']} phase={event['from_phase']}->{event['phase']} "
+                f"mode={event['mode']} lease={event['lease']} "
+                f"verdict={event['verdict'] or '—'} round={round_value} "
+                f"outcome={event['outcome'] or '—'}"
+            )
+        if task["artifacts"]:
+            print("  artifacts=" + ",".join(task["artifacts"]))
+
+
+def cmd_digest(args: argparse.Namespace) -> int:
+    """Read retained lifecycle events after an exclusive revision cursor."""
+    if args.since < 0:
+        print("cordboard: --since must be a non-negative revision", file=sys.stderr)
+        return EXIT_REFUSED
+    root = _root(args)
+    data = state.load(root)
+    state.validate(data)
+    if args.since > data["rev"]:
+        print(
+            f"cordboard: --since {args.since} is ahead of current rev {data['rev']}",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+    payload = _digest_payload(data, args.since)
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        _print_digest(payload)
     return 0
 
 
@@ -1832,9 +2311,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_take)
 
+    p = subs.add_parser("work", parents=[common], help="normal wake: observe or acquire work")
+    p.add_argument("agent")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_work)
+
+    p = subs.add_parser("renew", parents=[common], help="extend a live acquired work lease")
+    p.add_argument("agent")
+    p.add_argument(
+        "--rev", type=int, required=True, help="revision returned by work/take/renew"
+    )
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_renew)
+
     p = subs.add_parser("advance", parents=[common], help="finish one already-taken work beat")
     p.add_argument("agent")
-    p.add_argument("--rev", type=int, required=True, help="revision returned by take/brief")
+    p.add_argument(
+        "--rev", type=int, required=True, help="revision returned by work/take/renew"
+    )
     p.add_argument("--verdict", choices=VERDICTS)
     p.add_argument("--outcome", choices=("clean", "issues"))
     p.add_argument("--artifact", help="redline path, relative to the board or absolute")
@@ -1843,7 +2337,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = subs.add_parser("finish", parents=[common], help="complete done work and hand off queue")
     p.add_argument("agent")
-    p.add_argument("--rev", type=int, required=True, help="done revision returned by brief/advance")
+    p.add_argument(
+        "--rev", type=int, required=True, help="done revision returned by work/advance"
+    )
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_finish)
 
@@ -1851,6 +2347,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("task_id", nargs="?")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_recap)
+
+    p = subs.add_parser("digest", parents=[common], help="read factual history after a revision")
+    p.add_argument("--since", type=int, required=True, metavar="REV")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_digest)
 
     p = subs.add_parser("set", parents=[common], help="move the baton or change config")
     p.add_argument("--agent", help="who is acting")

@@ -62,7 +62,12 @@ def blank_board(workflow: str, reviewer: str, author: str) -> dict[str, Any]:
         "lease_seconds": state.DEFAULT_LEASE_SECONDS,
         "stall_after_seconds": state.DEFAULT_STALL_AFTER_SECONDS,
         "rev": 0,
-        "history": {"events": [], "truncated": False, "earliest_rev": None},
+        "history": {
+            "events": [],
+            "truncated": False,
+            "earliest_rev": None,
+            "incomplete_through_rev": None,
+        },
         "roles": {"reviewer": reviewer, "author": author},
         "agents": {
             reviewer: blank_agent(),
@@ -157,6 +162,7 @@ def _migrate_v3(root: str, old: dict[str, Any]) -> str:
         "events": [],
         "truncated": bool(int(old.get("rev", 0))),
         "earliest_rev": None,
+        "incomplete_through_rev": int(old.get("rev", 0)) or None,
     }
 
     upgraded = {}
@@ -177,18 +183,34 @@ def _migrate_v3(root: str, old: dict[str, Any]) -> str:
 
 
 def _migrate_v4(root: str, old: dict[str, Any]) -> str:
-    """v4 -> v5: add an honest empty history ring without inventing old events."""
+    """v4 -> current: add an honest empty history ring without inventing old events."""
     fresh = dict(old)
     fresh["version"] = state.SCHEMA_VERSION
     fresh["history"] = {
         "events": [],
         "truncated": bool(int(old.get("rev", 0))),
         "earliest_rev": None,
+        "incomplete_through_rev": int(old.get("rev", 0)) or None,
     }
     if os.path.exists(state.status_path(root)):
         shutil.copyfile(state.status_path(root), state.status_path(root) + ".v4.bak")
     state.write_atomic(root, fresh)
     return f"migrated v4 -> v{state.SCHEMA_VERSION}: factual history starts empty"
+
+
+def _migrate_v5(root: str, old: dict[str, Any]) -> str:
+    """v5 -> v6: persist an honest exact boundary for previously unknown history."""
+    fresh = dict(old)
+    fresh["version"] = state.SCHEMA_VERSION
+    old_history = dict(old.get("history") or {})
+    old_history["incomplete_through_rev"] = (
+        int(old.get("rev", 0)) if old_history.get("truncated") else None
+    )
+    fresh["history"] = old_history
+    if os.path.exists(state.status_path(root)):
+        shutil.copyfile(state.status_path(root), state.status_path(root) + ".v5.bak")
+    state.write_atomic(root, fresh)
+    return f"migrated v5 -> v{state.SCHEMA_VERSION}: exact history loss boundary added"
 
 
 def migrate_v2(root: str, legacy: str) -> str:
@@ -207,6 +229,8 @@ def migrate_v2(root: str, legacy: str) -> str:
         return _migrate_v3(root, old)
     if version == 4:
         return _migrate_v4(root, old)
+    if version == 5:
+        return _migrate_v5(root, old)
 
     # v2's `mode` is not carried across: solo is now expressed by pointing both
     # roles at one agent, so the field has nowhere to go and needs nowhere to go.
@@ -225,6 +249,7 @@ def migrate_v2(root: str, legacy: str) -> str:
     fresh["lease_seconds"] = int(old.get("lease_seconds", state.DEFAULT_LEASE_SECONDS))
     fresh["rev"] = int(old.get("rev", 0))
     fresh["history"]["truncated"] = bool(fresh["rev"])
+    fresh["history"]["incomplete_through_rev"] = fresh["rev"] or None
     fresh["lock"] = old.get("lock") or fresh["lock"]
 
     old_task = old.get("task") or {}

@@ -104,6 +104,7 @@ def test_migrate_v2_keeps_the_task_in_flight(tmp_path):
         "events": [],
         "truncated": True,
         "earliest_rev": None,
+        "incomplete_through_rev": 41,
     }
     assert "migrated v2" in report
 
@@ -140,12 +141,31 @@ def test_migrate_v4_adds_honest_empty_history_and_backup(tmp_path):
     report = migrate_v2(root, root)
     migrated = state.load(root)
 
-    assert report == "migrated v4 -> v5: factual history starts empty"
+    assert report == "migrated v4 -> v6: factual history starts empty"
     assert migrated["version"] == state.SCHEMA_VERSION
     assert migrated["history"] == {
         "events": [],
         "truncated": True,
         "earliest_rev": None,
+        "incomplete_through_rev": 7,
     }
     assert os.path.exists(state.status_path(root) + ".v4.bak")
+    state.validate(migrated)
+
+
+def test_migrate_v5_persists_unknown_history_boundary(tmp_path):
+    root = str(tmp_path / "cordboard")
+    init_board(root)
+    old = state.load(root)
+    old["version"] = 5
+    old["rev"] = 9
+    old["history"] = {"events": [], "truncated": True, "earliest_rev": None}
+    state.write_atomic(root, old)
+
+    report = migrate_v2(root, root)
+    migrated = state.load(root)
+
+    assert report == "migrated v5 -> v6: exact history loss boundary added"
+    assert migrated["history"]["incomplete_through_rev"] == 9
+    assert os.path.exists(state.status_path(root) + ".v5.bak")
     state.validate(migrated)

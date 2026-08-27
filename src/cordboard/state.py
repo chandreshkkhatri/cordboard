@@ -22,8 +22,11 @@ from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timezone
 from typing import Any
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 HISTORY_CAP = 128
+HISTORY_FIELDS = frozenset(
+    {"events", "truncated", "earliest_rev", "incomplete_through_rev"}
+)
 HISTORY_EVENT_FIELDS = frozenset(
     {
         "rev",
@@ -155,9 +158,12 @@ def validation_errors(data: dict[str, Any]) -> list[str]:
     if not isinstance(history, dict):
         errors.append("history must be an object")
     else:
+        if set(history) != HISTORY_FIELDS:
+            errors.append("history must contain exactly the bounded history fields")
         events = history.get("events")
         truncated = history.get("truncated")
         earliest = history.get("earliest_rev")
+        incomplete_through = history.get("incomplete_through_rev")
         if not isinstance(events, list):
             errors.append("history.events must be an array")
             events = []
@@ -165,6 +171,26 @@ def validation_errors(data: dict[str, Any]) -> list[str]:
             errors.append(f"history.events must contain at most {HISTORY_CAP} events")
         if not isinstance(truncated, bool):
             errors.append("history.truncated must be true or false")
+        if incomplete_through is not None and (
+            isinstance(incomplete_through, bool)
+            or not isinstance(incomplete_through, int)
+            or incomplete_through < 0
+        ):
+            errors.append(
+                "history.incomplete_through_rev must be a non-negative integer or null"
+            )
+        elif isinstance(revision, int) and (
+            isinstance(incomplete_through, int) and incomplete_through > revision
+        ):
+            errors.append("history.incomplete_through_rev cannot exceed board rev")
+        if truncated is False and incomplete_through is not None:
+            errors.append(
+                "history.incomplete_through_rev must be null when history is not truncated"
+            )
+        if truncated is True and incomplete_through is None:
+            errors.append(
+                "history.incomplete_through_rev is required when history is truncated"
+            )
         if earliest is not None and (
             isinstance(earliest, bool) or not isinstance(earliest, int) or earliest < 0
         ):
@@ -529,7 +555,13 @@ def record_history_event(
 ) -> None:
     """Append one bounded machine event to the current state transaction."""
     history = data.setdefault(
-        "history", {"events": [], "truncated": False, "earliest_rev": None}
+        "history",
+        {
+            "events": [],
+            "truncated": False,
+            "earliest_rev": None,
+            "incomplete_through_rev": None,
+        },
     )
     events = history.setdefault("events", [])
     events.append(
@@ -551,6 +583,12 @@ def record_history_event(
         }
     )
     if len(events) > HISTORY_CAP:
-        del events[: len(events) - HISTORY_CAP]
+        discarded = events[: len(events) - HISTORY_CAP]
+        del events[: len(discarded)]
         history["truncated"] = True
+        prior_boundary = history.get("incomplete_through_rev")
+        history["incomplete_through_rev"] = max(
+            discarded[-1]["rev"],
+            prior_boundary if isinstance(prior_boundary, int) else 0,
+        )
     history["earliest_rev"] = events[0]["rev"] if events else None

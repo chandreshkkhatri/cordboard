@@ -131,6 +131,9 @@ TAKE_PHASES: dict[str, dict[str, str]] = {
 
 TAKE_MODES = ("started", "resumed", "claimed")
 
+# A normal wake observes passive state or performs the same acquisition as take.
+WORK_MODES = ("observed", *TAKE_MODES)
+
 TAKE_REFUSALS = (
     "unknown_agent",
     "disabled",
@@ -163,6 +166,24 @@ ADVANCE_PHASES: dict[str, dict[str, tuple[str, ...]]] = {
 }
 
 ADVANCE_MODES = ("handed_off", "continued", "finished")
+
+# Every phase that can be renewed already represents acquired work and can be
+# completed by ``advance``. This includes the claimed-in-place response phases.
+RENEW_PHASES = tuple(
+    dict.fromkeys(phase for mapping in ADVANCE_PHASES.values() for phase in mapping)
+)
+
+RENEW_REFUSALS = (
+    "unknown_agent",
+    "disabled",
+    "revision_mismatch",
+    "not_owner",
+    "missing_task",
+    "unsupported_phase",
+    "lease_missing",
+    "lease_expired",
+    "lease_foreign",
+)
 
 ADVANCE_REFUSALS = (
     "unknown_agent",
