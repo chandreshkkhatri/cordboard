@@ -151,6 +151,9 @@ def validation_errors(data: dict[str, Any]) -> list[str]:
             errors.append(f"agents.{name}.tick must be a schedule string or null")
         if watch is False and not tick:
             errors.append(f"agents.{name} has neither watch nor tick and cannot wake")
+        cursor = block.get("chat_cursor")
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+            errors.append(f"agents.{name}.chat_cursor must be a non-negative integer")
 
     lock = data.get("lock")
     if not isinstance(lock, dict):
@@ -226,13 +229,16 @@ def update(
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 data = load(root)
-                base_rev = int(data.get("rev", 0))
+                validate(data)
+                base_rev = data["rev"]
                 draft = copy.deepcopy(data)
                 if mutate(draft) is False:
                     return data, False
                 # Re-read inside the lock: another writer may have landed between
                 # the caller's own earlier read and this critical section.
-                if int(load(root).get("rev", 0)) != base_rev:
+                latest = load(root)
+                validate(latest)
+                if latest["rev"] != base_rev:
                     continue
                 # Stamped here rather than by callers: every phase change goes
                 # through this function, and a hand-maintained timestamp is one

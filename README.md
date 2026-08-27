@@ -190,10 +190,16 @@ one locked state update, then either completes the beat once or writes nothing. 
 `--outcome clean|issues`; redline gates add `--verdict approve|revise|reject` and may use
 `--artifact <path>` for a non-default redline file.
 
-Plan and redline artifacts must be regular, non-empty UTF-8 files contained in the board's
-`plans/` directory. Cross-agent handoffs and `done` release the lease; same-agent continuations keep
-it. The command does not edit TODO, chat, notes, artifacts, or git, and does not require an
-incremental summary.
+The current `task.dir` must resolve inside the board's `plans/` directory. Plan and redline
+artifacts must be regular, non-empty UTF-8 files whose resolved paths remain inside that task
+directory, so another task's evidence cannot be substituted through a path or symlink. Cross-agent
+handoffs and `done` release the lease; same-agent continuations keep it. The command does not edit
+TODO, chat, notes, artifacts, or git, and does not require an incremental summary.
+
+At `done`, an auto-committing agent derives a conservative candidate file set from the task plan
+and review artifacts, then reconciles it with the current git diff/status. It commits only changes
+with unambiguous task ownership. Ambiguity disables auto-commit for that task: the agent leaves the
+task incomplete and uses the supplied blocked transition to request a human scope decision.
 
 ---
 

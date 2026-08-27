@@ -12,7 +12,17 @@ import re
 
 from cordboard import SCHEMA_VERSION, __version__, cli
 from cordboard.templates import blank_board
-from cordboard.workflows import PHASES
+from cordboard.workflows import (
+    ADVANCE_MODES,
+    ADVANCE_PHASES,
+    ADVANCE_REFUSALS,
+    BRIEF_DISPOSITIONS,
+    BRIEF_GUIDANCE,
+    PHASES,
+    TAKE_MODES,
+    TAKE_PHASES,
+    TAKE_REFUSALS,
+)
 
 _ROOT = os.path.dirname(os.path.dirname(__file__))
 SPEC = os.path.join(_ROOT, "src", "cordboard", "data", "instructions.md")
@@ -74,6 +84,50 @@ def test_every_phase_of_every_workflow_is_named():
         assert f"## Workflow: `{workflow}`" in text, workflow
         for phase in phases:
             assert f"`{phase}`" in text, f"{workflow}.{phase} is undocumented"
+
+
+def test_every_documented_phase_has_compact_agent_guidance():
+    assert "cordboard brief <agent>" in spec_text()
+    for workflow, phases in PHASES.items():
+        assert set(BRIEF_GUIDANCE[workflow]) == set(phases)
+        for phase in phases:
+            assert BRIEF_GUIDANCE[workflow][phase]["instructions"]
+    for disposition in BRIEF_DISPOSITIONS:
+        assert f"`{disposition}`" in spec_text()
+
+
+def test_take_contract_is_documented_from_code_owned_tables():
+    text = spec_text()
+    for workflow, mapping in TAKE_PHASES.items():
+        assert workflow in text
+        for source, target in mapping.items():
+            assert f"`{source}`" in text
+            assert f"`{target}`" in text
+    for value in (*TAKE_MODES, *TAKE_REFUSALS):
+        assert f"`{value}`" in text
+
+
+def test_advance_contract_is_documented_from_code_owned_tables():
+    text = spec_text()
+    assert "cordboard advance <agent> --rev" in text
+    for workflow, mapping in ADVANCE_PHASES.items():
+        assert workflow in text
+        for source, targets in mapping.items():
+            assert f"`{source}`" in text
+            for target in targets:
+                assert f"`{target}`" in text
+    for value in (*ADVANCE_MODES, *ADVANCE_REFUSALS):
+        assert f"`{value}`" in text
+    assert "resolved path stays\ninside that current task directory" in text
+
+
+def test_commit_scope_does_not_depend_on_incremental_agent_notes():
+    text = spec_text()
+    assert "records that file list" not in text
+    assert "note; stage exactly" not in text
+    assert "task plan and review artifacts" in text
+    assert "Ambiguity means no auto-commit" in text
+    assert "human_required" in text
 
 
 def test_no_references_to_the_repo_it_came_from():
