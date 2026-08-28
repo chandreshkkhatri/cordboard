@@ -15,8 +15,8 @@ import sys
 import time
 from typing import Any
 
-from . import chat, roles, state, tasks
-from .templates import init_board, migrate_v2
+from . import __version__, chat, roles, state, tasks
+from .templates import init_board, migrate_board
 from .workflows import (
     ADVANCE_MODES,
     ADVANCE_PHASES,
@@ -91,7 +91,7 @@ def _assign(data: dict[str, Any], dotted: str, value: Any) -> None:
 def cmd_init(args: argparse.Namespace) -> int:
     root = _root(args)
     if args.migrate:
-        report = migrate_v2(root, args.legacy or root)
+        report = migrate_board(root, args.legacy or root)
         print(report)
         return 0
     created = init_board(
@@ -2270,6 +2270,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Pass work between coding agents with a file-based baton.",
     )
     parser.add_argument("--dir", help=f"board directory (default ./{state.DIR_NAME})")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     # --dir again on every subcommand, so both `cordboard --dir X set` and
     # `cordboard set --dir X` work. SUPPRESS matters: without it the subparser
@@ -2283,8 +2284,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workflow", choices=sorted(PHASES), default="redline")
     p.add_argument("--reviewer", default="reviewer", help="agent name for the reviewer role")
     p.add_argument("--author", default="author", help="agent name for the author role")
-    p.add_argument("--migrate", action="store_true", help="import a v2 collab/ board")
-    p.add_argument("--legacy", help="path to the v2 board (default: --dir)")
+    p.add_argument("--migrate", action="store_true", help="upgrade a schema v2-v5 board")
+    p.add_argument("--legacy", help="path to the v2-v5 board (default: --dir)")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_init)
 

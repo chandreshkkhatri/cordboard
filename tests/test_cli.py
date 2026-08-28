@@ -5,8 +5,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from cordboard import state
 from cordboard.cli import EXIT_BAD_STATE, EXIT_REFUSED, main
+
+
+def test_root_version_is_exact_and_does_not_touch_a_board(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as stopped:
+        main(["--version"])
+    assert stopped.value.code == 0
+    assert capsys.readouterr().out == "cordboard 0.3.0\n"
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_start_kicks_off_without_force(board, capsys):

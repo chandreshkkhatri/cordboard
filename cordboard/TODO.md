@@ -10,6 +10,7 @@ Format: `- [ ] <short-id> — <what needs to be true when this is done>`
 
 <!-- add tasks below this line; the bottom one runs next -->
 
+- [x] pm2-iter-10 — Prove and polish the ship-ready 0.3.0 agent-first product contract
 - [x] pm2-iter-09 — Renew long-running acquired work without polluting lifecycle evidence
 - [x] pm2-iter-08 — Produce a bounded read-only multi-task digest with continuation watermark
 - [x] pm2-iter-07 — Make work the one-call normal agent wake and acquisition path

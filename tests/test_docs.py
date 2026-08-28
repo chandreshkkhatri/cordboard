@@ -30,6 +30,7 @@ from cordboard.workflows import (
 
 _ROOT = os.path.dirname(os.path.dirname(__file__))
 SPEC = os.path.join(_ROOT, "src", "cordboard", "data", "instructions.md")
+LIVE_SPEC = os.path.join(_ROOT, "cordboard", "instructions.md")
 
 
 def spec_text() -> str:
@@ -69,6 +70,31 @@ def test_spec_heading_and_package_metadata_versions_match():
         match = re.search(r'^version = "([^"]+)"$', handle.read(), re.M)
     assert match
     assert match.group(1) == __version__
+    assert __version__ == "0.3.0"
+    assert SCHEMA_VERSION == 6
+
+
+def test_release_help_describes_the_supported_migration_range():
+    parser = cli.build_parser()
+    subcommands = next(
+        action.choices for action in parser._actions if getattr(action, "choices", None)
+    )
+    help_text = subcommands["init"].format_help()
+    assert "schema v2-v5" in help_text
+    assert "v2-v5 board" in help_text
+    assert "legacy v2 boards" not in readme_text()
+
+
+def test_build_manifest_includes_code_and_packaged_spec():
+    with open(os.path.join(_ROOT, "pyproject.toml"), encoding="utf-8") as handle:
+        metadata = handle.read()
+    assert 'packages = ["src/cordboard"]' in metadata
+    assert 'include = ["src/cordboard/**"]' in metadata
+
+
+def test_live_and_packaged_protocol_specs_are_byte_identical():
+    with open(SPEC, "rb") as packaged, open(LIVE_SPEC, "rb") as live:
+        assert live.read() == packaged.read()
 
 
 def test_every_subcommand_is_documented():

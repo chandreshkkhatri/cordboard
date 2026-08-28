@@ -321,7 +321,7 @@ Configure your agent runner, cron job, or loop wrapper with this prompt:
 
 | Command | Description |
 |---|---|
-| `cordboard init [--migrate]` | Initialize `./cordboard/` in the repository. `--migrate` imports legacy v2 boards. |
+| `cordboard init [--migrate]` | Initialize `./cordboard/` in the repository. `--migrate` upgrades schema v2-v5 boards. |
 | `cordboard status [--json] [--stalled]` | Show board status, lease, and task queue. `--json` includes computed `_task_stack`. |
 | `cordboard brief <agent> [--json]` | Read-only compact briefing (board, task, turn, action, chat). |
 | `cordboard take <agent> [--json]` | Atomically acquire actionable work, claim lease, and output post-take brief. |
@@ -339,6 +339,12 @@ Configure your agent runner, cron job, or loop wrapper with this prompt:
 | `cordboard task complete [--next]` | Human override for manual check-off/start-next or park behavior. |
 | `cordboard doctor` | Validate `status.json` schema, agent wake configurations, and `TODO.md` integrity. |
 | `cordboard spec` | Print the full protocol specification (`instructions.md`). |
+
+`cordboard init --migrate [--legacy PATH]` accepts schema v2-v5 and installs schema v6 only after
+the complete candidate validates. It preserves revision, task, roles/agents, the honest history
+boundary, TODO, chat, and plans; installs the current packaged spec; and backs up an existing
+destination status as `status.json.vN.bak`. Missing, malformed, v1, and future schemas are refused
+without modifying the destination.
 
 ---
 

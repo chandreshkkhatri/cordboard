@@ -189,8 +189,9 @@ offset is gone.
 
 ## State: never hand-edit `status.json`
 
-Every mutation goes through `cordboard set`, which takes an `flock` and does a `rev`
-compare-and-swap. Hand-editing races with a live agent and silently loses writes.
+Every mutation goes through a guarded command backed by the same locked `rev`
+compare-and-swap. `cordboard set` is the lower-level operator escape hatch. Hand-editing races
+with a live agent and silently loses writes.
 
 | Command | Purpose |
 |---|---|
@@ -208,8 +209,13 @@ compare-and-swap. Hand-editing races with a live agent and silently loses writes
 | `cordboard say` | Append to / read the chat back-channel |
 | `cordboard task list\|start\|complete` | Inspect (`list --json`) or advance the LIFO task stack |
 | `cordboard doctor` | Validate board state and the TODO stack without writing |
-| `cordboard init` | Create a board, or `--migrate` a v2 one |
+| `cordboard init` | Create a board, or `--migrate` a schema v2-v5 one |
 | `cordboard spec` | Print this document |
+
+`cordboard init --migrate [--legacy PATH]` validates the complete schema v6 candidate before it
+writes. It preserves revision/task/roles/agents and the honest history boundary, keeps
+TODO/chat/plans, installs this current spec, and backs up an existing destination status as
+`status.json.vN.bak`. Missing, malformed, v1, and future schemas are refused without modification.
 
 Every command takes `--dir <path>`, before or after the subcommand, and honours `$CORDBOARD_DIR`.
 Without either, the board is `./cordboard/` relative to the working directory — so a tick that runs
@@ -661,9 +667,10 @@ Rules:
   in a redline comment or in `status.json`.
 - **Append-only.** Never rewrite or delete entries. A dedicated `.chat.lock` serializes rotation
   with each `O_APPEND` write, so concurrent senders cannot strand or interleave an entry.
-- **Read first.** Every normal wake starts with `cordboard work <self>`, whose returned brief peeks
-  at unread chat before presenting the phase action. If `acquired=true`, begin those instructions
-  without calling `take` again. Consume incorporated messages with `cordboard say --read <self>`.
+- **Context first.** Every normal wake starts with `cordboard work <self>`, whose returned brief
+  includes unread chat with the phase action. Incorporate that context before acting. If
+  `acquired=true`, begin those instructions without calling `take` again; then consume incorporated
+  messages with `cordboard say --read <self>`.
 - `human` is a valid addressee for things that need operator attention but do not justify `blocked`.
 - The file rotates to `chat.<date>.md` past ~200 KB once every registered agent has consumed it.
   An unread agent defers rotation, because delivery is more important than the soft size limit.
@@ -805,8 +812,8 @@ agent — a cron entry, a recurring timer, a wrapper script:
 > diagnostics or integration recovery. Read `cordboard/instructions.md` only for bootstrap or
 > recovery when the compact context is insufficient. Do nothing outside the current task.
 
-Reading the back-channel **first** is part of the algorithm: a message from the other agent may
-change how you handle the phase you are about to act on.
+Using the back-channel bundled into `work` before the phase action is part of the algorithm: a
+message from the other agent may change how you handle the phase you are about to act on.
 
 ### Arming the watcher — for both agents
 

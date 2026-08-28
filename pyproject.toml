@@ -1,6 +1,6 @@
 [project]
 name = "cordboard"
-version = "0.2.0"
+version = "0.3.0"
 description = "Pass work between coding agents with a file-based baton — no server, no broker, just a spec and a JSON file in your repo."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,7 +37,7 @@ packages = ["src/cordboard"]
 [tool.hatch.build]
 # The spec and templates ship with the package: agents read the spec at runtime,
 # and `cordboard init` writes the templates into the host repo.
-include = ["src/cordboard/data/*"]
+include = ["src/cordboard/**"]
 
 [tool.ruff]
 line-length = 100
