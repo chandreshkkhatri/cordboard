@@ -41,7 +41,7 @@ uvx cordboard init
 pipx run cordboard init
 
 # Or install from source
-git clone https://github.com/chandresh/cordboard && cd cordboard
+git clone https://github.com/chandreshkkhatri/cordboard && cd cordboard
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 ```
 
@@ -391,4 +391,4 @@ ruff check .
 
 ## License
 
-[MIT](LICENSE)
+[MIT](https://github.com/chandreshkkhatri/cordboard/blob/main/LICENSE)
