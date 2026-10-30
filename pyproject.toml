@@ -1,6 +1,6 @@
 [project]
 name = "cordboard"
-version = "0.2.0"
+version = "0.3.0"
 description = "Pass work between coding agents with a file-based baton — no server, no broker, just a spec and a JSON file in your repo."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -10,8 +10,16 @@ authors = [{ name = "Chandresh Kumar" }]
 keywords = ["agents", "coding-agents", "collaboration", "workflow", "baton"]
 classifiers = [
   "Development Status :: 3 - Alpha",
+  "Environment :: Console",
   "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Build Tools",
 ]
 # No runtime dependencies, on purpose: this is dropped into other people's repos
@@ -25,7 +33,10 @@ dev = ["pytest>=8", "ruff>=0.6"]
 cordboard = "cordboard.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/chandresh/cordboard"
+Homepage = "https://github.com/chandreshkkhatri/cordboard"
+Repository = "https://github.com/chandreshkkhatri/cordboard"
+Issues = "https://github.com/chandreshkkhatri/cordboard/issues"
+Releases = "https://github.com/chandreshkkhatri/cordboard/releases"
 
 [build-system]
 requires = ["hatchling"]
@@ -37,7 +48,12 @@ packages = ["src/cordboard"]
 [tool.hatch.build]
 # The spec and templates ship with the package: agents read the spec at runtime,
 # and `cordboard init` writes the templates into the host repo.
-include = ["src/cordboard/data/*"]
+include = ["src/cordboard/**"]
+
+[tool.hatch.build.targets.sdist]
+# The sdist also carries the test suite (and the live spec it compares against)
+# so downstream packagers can run it from the tarball.
+include = ["src/cordboard/**", "tests/**", "cordboard/instructions.md"]
 
 [tool.ruff]
 line-length = 100

@@ -24,3 +24,29 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest
       - run: python -m ruff check .
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install build
+      - run: python -m build
+      - name: Smoke wheel and source distribution in isolated environments
+        run: |
+          for artifact in dist/*.whl dist/*.tar.gz; do
+            environment="${RUNNER_TEMP}/smoke-$(basename "${artifact}")"
+            python -m venv "${environment}"
+            "${environment}/bin/python" -m pip install "${artifact}"
+            test "$("${environment}/bin/cordboard" --version)" = "cordboard 0.3.0"
+            board="${environment}/board"
+            "${environment}/bin/cordboard" --dir "${board}" init
+            "${environment}/bin/cordboard" --dir "${board}" doctor
+            "${environment}/bin/cordboard" spec > "${environment}/installed-spec.md"
+            cmp "${environment}/installed-spec.md" "${board}/instructions.md"
+            test "$(head -n 1 "${environment}/installed-spec.md")" = "# cordboard — protocol specification (schema v6)"
+            test "$("${environment}/bin/python" -c 'from importlib.metadata import version; print(version("cordboard"))')" = "0.3.0"
+          done

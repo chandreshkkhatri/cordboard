@@ -6,6 +6,8 @@ import fcntl
 import os
 import re
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +24,21 @@ class StackTask:
     title: str
     done: bool
     line: int
+
+
+class TaskNotFound(state.StateError):
+    """The board names a task that a valid TODO stack does not contain."""
+
+
+@contextmanager
+def locked(root: str) -> Iterator[None]:
+    """Hold the TODO lock; combined operations take the status lock first."""
+    with open(os.path.join(root, ".todo.lock"), "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def read(root: str) -> list[StackTask]:
@@ -84,33 +101,57 @@ def summary(root: str) -> dict[str, Any]:
 def complete(root: str, task_id: str) -> bool:
     """Atomically check off ``task_id``. Return false when it was already done."""
     path = state.stack_path(root)
-    lock_path = os.path.join(root, ".todo.lock")
-    with open(lock_path, "a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            entries = read(root)
-            item = next((candidate for candidate in entries if candidate.id == task_id), None)
-            if item is None:
-                raise state.StateError(f"active task {task_id!r} is not in {path}")
-            if item.done:
-                return False
+    with locked(root):
+        changed, _ = _complete_locked(root, task_id, path)
+        return changed
 
-            with open(path, encoding="utf-8") as handle:
-                lines = handle.read().splitlines(keepends=True)
-            lines[item.line - 1] = lines[item.line - 1].replace("- [ ]", "- [x]", 1)
 
-            fd, temporary = tempfile.mkstemp(dir=root, prefix=".TODO.", suffix=".tmp")
-            try:
-                os.fchmod(fd, 0o644)
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    handle.writelines(lines)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, path)
-            except BaseException:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
-                raise
-            return True
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+def finish_current(
+    root: str, task_id: str
+) -> tuple[bool, StackTask, StackTask | None]:
+    """Check off one task and select its LIFO successor under the TODO lock.
+
+    Callers that also mutate board state take the status lock first. This function
+    then takes only the TODO lock, establishing the global status -> TODO order.
+    A crash after this write is recoverable: a retry observes ``changed=False``
+    and returns the same successor from the still-valid stack.
+    """
+    with locked(root):
+        return finish_current_locked(root, task_id)
+
+
+def finish_current_locked(
+    root: str, task_id: str
+) -> tuple[bool, StackTask, StackTask | None]:
+    """Finish and select a successor while the caller holds :func:`locked`."""
+    path = state.stack_path(root)
+    changed, completed = _complete_locked(root, task_id, path)
+    next_task = next((item for item in reversed(read(root)) if not item.done), None)
+    return changed, completed, next_task
+
+
+def _complete_locked(root: str, task_id: str, path: str) -> tuple[bool, StackTask]:
+    entries = read(root)
+    item = next((candidate for candidate in entries if candidate.id == task_id), None)
+    if item is None:
+        raise TaskNotFound(f"active task {task_id!r} is not in {path}")
+    if item.done:
+        return False, item
+
+    with open(path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines(keepends=True)
+    lines[item.line - 1] = lines[item.line - 1].replace("- [ ]", "- [x]", 1)
+
+    fd, temporary = tempfile.mkstemp(dir=root, prefix=".TODO.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.writelines(lines)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+        raise
+    return True, item

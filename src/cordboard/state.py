@@ -18,10 +18,33 @@ import random
 import tempfile
 import time
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timezone
 from typing import Any
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
+HISTORY_CAP = 128
+HISTORY_FIELDS = frozenset(
+    {"events", "truncated", "earliest_rev", "incomplete_through_rev"}
+)
+HISTORY_EVENT_FIELDS = frozenset(
+    {
+        "rev",
+        "at",
+        "task_id",
+        "task_title",
+        "actor",
+        "action",
+        "from_phase",
+        "phase",
+        "mode",
+        "verdict",
+        "round",
+        "outcome",
+        "lease",
+        "artifacts",
+    }
+)
 
 DEFAULT_MAX_ROUNDS = 3
 DEFAULT_LEASE_SECONDS = 5400
@@ -102,7 +125,7 @@ def load(root: str) -> dict[str, Any]:
 
 def validation_errors(data: dict[str, Any]) -> list[str]:
     """Return schema and safety violations without mutating the board."""
-    from .workflows import PHASES, ROLES, VERDICTS
+    from .workflows import ADVANCE_MODES, PHASES, ROLES, TAKE_MODES, VERDICTS
 
     errors: list[str] = []
     if data.get("version") != SCHEMA_VERSION:
@@ -116,6 +139,12 @@ def validation_errors(data: dict[str, Any]) -> list[str]:
     flow = data.get("workflow")
     if flow not in PHASES:
         errors.append(f"workflow must be one of {sorted(PHASES)}, got {flow!r}")
+    known_phases = set().union(*(phases.keys() for phases in PHASES.values()))
+    history_modes = {
+        "take": set(TAKE_MODES),
+        "advance": set(ADVANCE_MODES),
+        "finish": {"next", "parked"},
+    }
 
     for key in ("max_rounds", "lease_seconds", "stall_after_seconds"):
         value = data.get(key)
@@ -124,6 +153,111 @@ def validation_errors(data: dict[str, Any]) -> list[str]:
     revision = data.get("rev")
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
         errors.append("rev must be a non-negative integer")
+
+    history = data.get("history")
+    if not isinstance(history, dict):
+        errors.append("history must be an object")
+    else:
+        if set(history) != HISTORY_FIELDS:
+            errors.append("history must contain exactly the bounded history fields")
+        events = history.get("events")
+        truncated = history.get("truncated")
+        earliest = history.get("earliest_rev")
+        incomplete_through = history.get("incomplete_through_rev")
+        if not isinstance(events, list):
+            errors.append("history.events must be an array")
+            events = []
+        elif len(events) > HISTORY_CAP:
+            errors.append(f"history.events must contain at most {HISTORY_CAP} events")
+        if not isinstance(truncated, bool):
+            errors.append("history.truncated must be true or false")
+        if incomplete_through is not None and (
+            isinstance(incomplete_through, bool)
+            or not isinstance(incomplete_through, int)
+            or incomplete_through < 0
+        ):
+            errors.append(
+                "history.incomplete_through_rev must be a non-negative integer or null"
+            )
+        elif isinstance(revision, int) and (
+            isinstance(incomplete_through, int) and incomplete_through > revision
+        ):
+            errors.append("history.incomplete_through_rev cannot exceed board rev")
+        if truncated is False and incomplete_through is not None:
+            errors.append(
+                "history.incomplete_through_rev must be null when history is not truncated"
+            )
+        if truncated is True and incomplete_through is None:
+            errors.append(
+                "history.incomplete_through_rev is required when history is truncated"
+            )
+        if earliest is not None and (
+            isinstance(earliest, bool) or not isinstance(earliest, int) or earliest < 0
+        ):
+            errors.append("history.earliest_rev must be a non-negative integer or null")
+        expected_earliest = (
+            events[0].get("rev") if events and isinstance(events[0], dict) else None
+        )
+        if earliest != expected_earliest:
+            errors.append("history.earliest_rev must match the first event revision")
+        previous_rev = -1
+        for index, event in enumerate(events):
+            prefix = f"history.events[{index}]"
+            if not isinstance(event, dict):
+                errors.append(f"{prefix} must be an object")
+                continue
+            if set(event) != HISTORY_EVENT_FIELDS:
+                errors.append(f"{prefix} must contain exactly the factual event fields")
+            event_rev = event.get("rev")
+            if (
+                isinstance(event_rev, bool)
+                or not isinstance(event_rev, int)
+                or event_rev < 1
+                or event_rev <= previous_rev
+            ):
+                errors.append(f"{prefix}.rev must be a positive increasing integer")
+            else:
+                previous_rev = event_rev
+                if isinstance(revision, int) and event_rev > revision:
+                    errors.append(f"{prefix}.rev cannot exceed board rev")
+            for key in ("at", "task_id", "actor", "action", "from_phase", "phase", "mode"):
+                if not isinstance(event.get(key), str) or not event[key]:
+                    errors.append(f"{prefix}.{key} must be a non-empty string")
+            event_at = event.get("at")
+            if isinstance(event_at, str):
+                try:
+                    datetime.strptime(event_at, TIMESTAMP)
+                except ValueError:
+                    errors.append(f"{prefix}.at must be a UTC timestamp")
+            title = event.get("task_title")
+            if title is not None and not isinstance(title, str):
+                errors.append(f"{prefix}.task_title must be a string or null")
+            action = event.get("action")
+            if action not in history_modes:
+                errors.append(f"{prefix}.action must be take, advance, or finish")
+            elif event.get("mode") not in history_modes[action]:
+                errors.append(f"{prefix}.mode is invalid for action {action}")
+            for phase_key in ("from_phase", "phase"):
+                if event.get(phase_key) not in known_phases:
+                    errors.append(f"{prefix}.{phase_key} must be a known phase")
+            if event.get("verdict") is not None and event.get("verdict") not in VERDICTS:
+                errors.append(f"{prefix}.verdict must be a known verdict or null")
+            event_round = event.get("round")
+            if event_round is not None and (
+                isinstance(event_round, bool)
+                or not isinstance(event_round, int)
+                or event_round < 0
+            ):
+                errors.append(f"{prefix}.round must be a non-negative integer or null")
+            if event.get("outcome") not in {None, "clean", "issues"}:
+                errors.append(f"{prefix}.outcome must be clean, issues, or null")
+            if event.get("lease") not in {"claimed", "retained", "released"}:
+                errors.append(f"{prefix}.lease must be claimed, retained, or released")
+            artifacts = event.get("artifacts")
+            if not isinstance(artifacts, list) or not all(
+                isinstance(path, str) and path for path in artifacts
+            ):
+                errors.append(f"{prefix}.artifacts must be an array of non-empty paths")
 
     mapping = data.get("roles")
     agents_block = data.get("agents")
@@ -151,6 +285,9 @@ def validation_errors(data: dict[str, Any]) -> list[str]:
             errors.append(f"agents.{name}.tick must be a schedule string or null")
         if watch is False and not tick:
             errors.append(f"agents.{name} has neither watch nor tick and cannot wake")
+        cursor = block.get("chat_cursor")
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+            errors.append(f"agents.{name}.chat_cursor must be a non-negative integer")
 
     lock = data.get("lock")
     if not isinstance(lock, dict):
@@ -210,12 +347,17 @@ def update(
     mutate: Callable[[dict[str, Any]], Any],
     actor: str = "user",
     retries: int = 40,
+    secondary_lock: Callable[[], AbstractContextManager[Any]] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Read-modify-write the board under a lock, with a rev compare-and-swap.
 
     ``mutate(data)`` receives a deep copy and edits it in place. Returning ``False``
     aborts the write — which is how a guard refuses, and how an idle tick says
     "nothing to do" without bumping ``rev``.
+
+    When supplied, ``secondary_lock`` is acquired after the status lock and held
+    through mutation and state commit. Multi-file operations use this to keep one
+    global lock order without exposing the status lock implementation.
 
     Returns ``(state, written)``.
     """
@@ -225,28 +367,33 @@ def update(
         with open(lock_file, "a+") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
-                data = load(root)
-                base_rev = int(data.get("rev", 0))
-                draft = copy.deepcopy(data)
-                if mutate(draft) is False:
-                    return data, False
-                # Re-read inside the lock: another writer may have landed between
-                # the caller's own earlier read and this critical section.
-                if int(load(root).get("rev", 0)) != base_rev:
-                    continue
-                # Stamped here rather than by callers: every phase change goes
-                # through this function, and a hand-maintained timestamp is one
-                # an agent eventually forgets on the path that matters.
-                before = (data.get("task") or {}).get("phase")
-                after = (draft.get("task") or {}).get("phase")
-                if after != before:
-                    draft.setdefault("task", {})["handoff_at"] = now()
-                draft["rev"] = base_rev + 1
-                draft["updated_at"] = now()
-                draft["updated_by"] = actor
-                validate(draft)
-                write_atomic(root, draft)
-                return draft, True
+                context = secondary_lock() if secondary_lock else nullcontext()
+                with context:
+                    data = load(root)
+                    validate(data)
+                    base_rev = data["rev"]
+                    draft = copy.deepcopy(data)
+                    if mutate(draft) is False:
+                        return data, False
+                    # Re-read inside both locks: another writer may have landed between
+                    # the caller's own earlier read and this critical section.
+                    latest = load(root)
+                    validate(latest)
+                    if latest["rev"] != base_rev:
+                        continue
+                    # Stamped here rather than by callers: every phase change goes
+                    # through this function, and a hand-maintained timestamp is one
+                    # an agent eventually forgets on the path that matters.
+                    before = (data.get("task") or {}).get("phase")
+                    after = (draft.get("task") or {}).get("phase")
+                    if after != before:
+                        draft.setdefault("task", {})["handoff_at"] = now()
+                    draft["rev"] = base_rev + 1
+                    draft["updated_at"] = now()
+                    draft["updated_by"] = actor
+                    validate(draft)
+                    write_atomic(root, draft)
+                    return draft, True
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         time.sleep(random.uniform(0.01, 0.05) * (attempt + 1))
@@ -388,3 +535,60 @@ def round_of(data: dict[str, Any], gate: str) -> int:
 
 def max_rounds(data: dict[str, Any]) -> int:
     return int(data.get("max_rounds") or DEFAULT_MAX_ROUNDS)
+
+
+def record_history_event(
+    data: dict[str, Any],
+    *,
+    task_id: str,
+    task_title: str | None,
+    actor: str,
+    action: str,
+    from_phase: str,
+    phase: str,
+    mode: str,
+    verdict: str | None = None,
+    round_number: int | None = None,
+    outcome: str | None = None,
+    lease: str,
+    artifacts: list[str] | tuple[str, ...] = (),
+) -> None:
+    """Append one bounded machine event to the current state transaction."""
+    history = data.setdefault(
+        "history",
+        {
+            "events": [],
+            "truncated": False,
+            "earliest_rev": None,
+            "incomplete_through_rev": None,
+        },
+    )
+    events = history.setdefault("events", [])
+    events.append(
+        {
+            "rev": int(data["rev"]) + 1,
+            "at": now(),
+            "task_id": task_id,
+            "task_title": task_title,
+            "actor": actor,
+            "action": action,
+            "from_phase": from_phase,
+            "phase": phase,
+            "mode": mode,
+            "verdict": verdict,
+            "round": round_number,
+            "outcome": outcome,
+            "lease": lease,
+            "artifacts": list(dict.fromkeys(path for path in artifacts if path)),
+        }
+    )
+    if len(events) > HISTORY_CAP:
+        discarded = events[: len(events) - HISTORY_CAP]
+        del events[: len(discarded)]
+        history["truncated"] = True
+        prior_boundary = history.get("incomplete_through_rev")
+        history["incomplete_through_rev"] = max(
+            discarded[-1]["rev"],
+            prior_boundary if isinstance(prior_boundary, int) else 0,
+        )
+    history["earliest_rev"] = events[0]["rev"] if events else None

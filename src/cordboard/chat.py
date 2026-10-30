@@ -108,8 +108,11 @@ def unread(root: str, data: dict[str, Any], agent: str) -> tuple[str, int]:
     path = state.chat_path(root)
     if not os.path.exists(path):
         return "", 0
-    with open(path, encoding="utf-8") as handle:
-        lines = handle.read().splitlines()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except UnicodeDecodeError as exc:
+        raise state.StateError(f"{path} is not valid UTF-8") from exc
     cursor = int((state.agents(data).get(agent) or {}).get("chat_cursor") or 0)
     if cursor > len(lines):
         cursor = 0  # rotated under us; re-read from the top rather than skip it
